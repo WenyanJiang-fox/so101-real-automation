@@ -257,6 +257,11 @@ class Panel:
                                     lambda: self.rig.submit(kind="replay_run"),
                                     width=26, fg="#d6e8ff", bg="#243a50")
         self.replay_btn.pack(fill="x", pady=1)
+        # **换抓取方向**（用户 2026-10-19）：让腕子去对**另一对**侧面。只对两对跨度
+        # 相同的方块（近似正方）有意义；长方体仍按小跨度那一对，转了也不会变。
+        self.side_btn = self._btn(box, "抓另一侧：关 / F6", self._toggle_side,
+                                  width=26, fg="#e0d6ff", bg="#3a2f5a")
+        self.side_btn.pack(fill="x", pady=1)
         # **自动连跑**（用户 2026-10-18）：闸口全关，跑完回初始位置再接下一样。
         # 再按一下（或 F5）就关；「停手」「放弃」也会把它关掉。
         self.auto_btn = self._btn(box, "自动连跑：关 / F5", self._toggle_auto,
@@ -401,6 +406,14 @@ class Panel:
         on = not bool((self._last_snap or {}).get("auto"))
         self.rig.submit(kind="auto", on=on)
 
+    def _toggle_side(self) -> None:
+        """翻「换抓取方向」开关。**状态以界面这一头为准** —— 只有这里改它。"""
+        on = not bool(getattr(self, "_side_on", False))
+        self._side_on = on
+        self.side_btn.configure(text=f"抓另一侧：{'开' if on else '关'} / F6",
+                                bg=("#4a3a7a" if on else "#3a2f5a"))
+        self.rig.submit(kind="grasp_side", deg=(90.0 if on else 0.0))
+
     def _resume(self) -> None:
         """从断点继续。**入口由 `rig.resume_stage()` 定**，这里只把命令递进去：
         `align` 先抬到安全高度再从头走，`fine` 续微调，`close` 直接下探一截并合爪。"""
@@ -433,6 +446,7 @@ class Panel:
     def _bind_keys(self) -> None:
         r = self.root
         r.bind("<F1>", lambda e: self.rig.submit(kind="pick_run"))
+        r.bind("<F6>", lambda e: self._toggle_side())
         r.bind("<F5>", lambda e: self._toggle_auto())
         r.bind("<space>", lambda e: self._gate("go"))
         r.bind("<F2>", lambda e: self._gate("relook"))

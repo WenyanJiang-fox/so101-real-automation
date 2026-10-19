@@ -70,6 +70,9 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         # 开关只由面板那几个按钮/键改；`stop`、断点上「放弃」都会把它关掉。
         self._auto = False
         self._round = 0
+        # **换抓取方向**（用户 2026-10-19）：0 = 按形状自己挑，90 = 去对另一对侧面。
+        # 开关是面板上那个按钮；自动连跑时一直沿用这个值。
+        self.grasp_side_deg = 0.0
         self._status = "starting"
         # 最近一次技能的结果（`_run_pick` 写、界面读）。没跑过就是 None。
         self._last_skill: dict | None = None
@@ -337,6 +340,14 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         if kind == "grip_cal":
             self._measure_grip_range()
             return
+        if kind == "grasp_side":
+            # **只改一个数，不动臂**（跟 `gate` 一样放在 `terminated = False` 之前）。
+            self.grasp_side_deg = float(cmd.get("deg", 0.0) or 0.0)
+            self._log("换抓取方向：" + (
+                "关（按形状自己挑那一对）" if abs(self.grasp_side_deg) < 1e-6 else
+                f"开（参考轴转 {self.grasp_side_deg:+.0f}°，去对另一对侧面）"))
+            return
+
         if kind == "gate":
             # **放在这一组里**（跟 `see` / `torque` 一样，在 `terminated = False` 之前）：
             # 写文件不动臂，不该顺手把「停手」那个标志清掉。
@@ -467,7 +478,8 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         rec = joint_rec.begin(self.arm)
         try:
             out = skill_driver.run_pick(self, name, gates=not self._auto,
-                                        start_at=start_at)
+                                        start_at=start_at,
+                                        grasp_side=self.grasp_side_deg)
         finally:
             joint_rec.end()
         ok = bool(out.get("ok"))

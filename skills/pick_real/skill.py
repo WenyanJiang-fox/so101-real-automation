@@ -18,8 +18,8 @@ from .knobs import CLOSE_START_STEPS, FIX_CLEAR_REAL, GRASP_Z_MARGIN_REAL, GRASP
 from .align import _align, _set_clearance
 from .pose import _align_deg, _declared_half, _fold90, _h, _vertical, _wrist
 from .gates import (_arm_off_checkpoint, _descend_to_grasp, _drop_checkpoint,
-                    _load_checkpoint, _raise_to_safe, _resume_on, _save_checkpoint,
-                    _start_at, _stop_here)
+                    _grasp_side_deg, _load_checkpoint, _raise_to_safe, _resume_on,
+                    _save_checkpoint, _start_at, _stop_here)
 from .rulers import _box_deg_px, _jaw_axis_deg, _jaw_axis_model_deg, _jaw_shape, _save_look, _yaw_from_px
 from .grasp import _close_until_stall, _grip_hold, _gripper_deg
 from .motion import _descend, _goto, _trace
@@ -515,7 +515,19 @@ class PickRealSkill(Skill):
         # **旋转对称的形状（圆柱/杯子）模型那条恒为 0**（`normal` 直接回当前开合轴）——
         # 那就不问模型、改问画面（红区剪影的边）。`use_px` 那条只在形状对称时才走。
         _sym = getattr(sh, "yaw_period_deg", 1.0) is None
-        closing = np.asarray(sh.normal(yaw, arm.tool_x()), dtype=np.float64)
+        # **换抓取方向**（用户 2026-10-19）：把选面的参考轴绕竖直轴转一个角度，让腕子
+        # 去对另一对侧面。0 = 现状；90 = 另一对。只有两对跨度相同（正方体）才真的会换 ——
+        # 长方体由形状按小跨度定，转了也还是那一对。
+        _side_deg = _grasp_side_deg()
+        _ref = np.asarray(arm.tool_x(), dtype=np.float64).reshape(-1)
+        if abs(_side_deg) > 1e-6:
+            _c, _s = np.cos(np.radians(_side_deg)), np.sin(np.radians(_side_deg))
+            _ref = np.array([_c * _ref[0] - _s * _ref[1],
+                             _s * _ref[0] + _c * _ref[1],
+                             float(_ref[2]) if _ref.size > 2 else 0.0],
+                            dtype=np.float64)
+            print(f"    抓取方向：参考轴转 {_side_deg:+.0f}°（去对另一对侧面）")
+        closing = np.asarray(sh.normal(yaw, _ref), dtype=np.float64)
         state.seg = "腕子对上方块侧面"
         steps, left = _align(arm, closing, cam=_wrist(cams), percep=percep, use_px=_sym)
         # 转完把 `closing` 跟到新朝向（圆柱的 `normal` 就是当前开合轴）。不跟的话

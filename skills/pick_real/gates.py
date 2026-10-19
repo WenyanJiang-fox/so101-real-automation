@@ -83,6 +83,20 @@ def _start_at() -> str | None:
     got = os.environ.get("PICK_START_AT", "").strip().lower()
     return got or None
 
+def _grasp_side_deg() -> float:
+    """**换抓取方向**：把选面的参考轴绕竖直轴转这么多度（环境变量 `PICK_GRASP_SIDE_DEG`）。
+
+    `0` = 现状（按形状自己挑那一对侧面）；`90` = 去对**另一对**侧面。
+    只有两对跨度相同时（正方体）才会真的换 —— 长方体由 `Shape.normal` 按小跨度定，
+    转多少度都还是原来那一对（`core/shapes.py:189` 那段口径）。
+    """
+    import os                                                   # noqa: PLC0415
+
+    try:
+        return float(os.environ.get("PICK_GRASP_SIDE_DEG", "0") or 0.0)
+    except ValueError:
+        return 0.0
+
 def _raise_to_safe(arm) -> float:
     """**续跑第一步：竖直抬到安全高度**（`knobs.HOME_RAISE_Z_M`），返回抬完的 TCP z。
 
