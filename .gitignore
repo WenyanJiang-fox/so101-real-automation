@@ -1,0 +1,14 @@
+# 运行产物：日志、截图、录像、串口回放
+out/
+*.log
+*.mp4
+
+# 版本备份（按日期落在 _backup/ 下，是另一套回滚手段）
+_backup/
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时输出
+_scratch_out.txt

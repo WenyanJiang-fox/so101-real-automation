@@ -1,0 +1,8 @@
+{
+  "note": "2026-10-19 用户手摆的抓取姿态。刻度是当时从总线真读到的值；6 号那一次读丢包，没有同期读数。",
+  "ticks": {"1": 2005, "2": 2315, "3": 1435, "4": 3184, "5": 495},
+  "joints_deg": {"shoulder_pan": -18.7, "shoulder_lift": 32.2, "elbow_flex": -43.8, "wrist_flex": 94.9, "wrist_roll": -136.5},
+  "tcp_mm": [260.4, 81.8, -35.6],
+  "gripper_tick_at_placement": null,
+  "gripper_tick_after_open": 2936
+}
