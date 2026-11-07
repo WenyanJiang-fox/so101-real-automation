@@ -9,7 +9,7 @@
 核心取舍是「脚本保底、模型只接一小段」：
 
 - 脚本技能负责可解释的部分：回位、悬停、转腕对轴、下探、合爪、抬升、放置。
-- π0.5 只接最后一段（横向对齐、下探、合爪）；模型只出动作，成败仍由脚本判。
+- π0.5 只接最后一段（横向对齐、合爪）；另有提前接管的变体，连下探也交给模型。模型只出动作，成败仍由脚本判。
 - Qwen3-VL 只做合爪前的否决，不指挥机械臂，也不参与轮末成败判定。
 - 失败按失败码归因，三档策略按码路由；失败样本回流成 VLM 判官的训练对。
 
@@ -22,7 +22,7 @@
 | 数据采集 | 4 Hz、腕 + 侧双相机；无人值守连续采集 6 小时，产出 120 条，有效率 68% |
 | 失败归因 | 7 类失败码：`off_axis` / `too_low` / `too_high` / `no_gap` / `slip` / `descend_fail` / `other` |
 | 末端策略 | π0.5 LoRA（仅 adapter，`action_horizon=10`） |
-| 端到端 | 脚本对轴 + π0.5 接管末段（下探 / 横向对齐 / 合爪）：单趟平均 100 s → 43 s，抓取成功率 83% |
+| 端到端 | 脚本对轴下探 + π0.5 接管末段（横向对齐 / 合爪）：单趟平均 100 s → 43 s，抓取成功率 83% |
 | 策略路由 | 三档 `oneshot` / `full` / `vla_end`，按失败码自动路由 |
 | VLM 判官 | Qwen3-VL LoRA r16/α32；6 类失败场景 300 条成对训练，280 条评测二分类准确率 92.9% |
 
@@ -55,7 +55,7 @@
       ▼
 脚本技能：回位 → 悬停 → 转腕对轴 → 竖直下探 → 合爪 → 抬升 → 放置
       │                                   │
-      │                                   └─ vla_end：下探 / 横向对齐 / 合爪交给 π0.5
+      │                                   └─ vla_end 变体：从下探起交给 π0.5
       ▼
 判官：6 号舵机角度（held / empty） + 轮末 Judge
 ```
@@ -63,7 +63,7 @@
 1. 回初始位：`home_real` 把六轴回到 `real_home.RAW_HOME`，腕相机正对桌面。
 2. 看一眼：`real/perception.py` 用 HSV 找目标色块，用矩形填充率过滤同色杂物；`core/vision.py` 用相机内参和手眼标定把像素反推到基座系，估中心、朝向和尺寸。
 3. 进场与转腕：`skills/pick_real/motion.py` 走到悬停点；`align.py` 把合爪轴（工具 x 轴）转到方块侧面法向。
-4. 对轴下探：`rulers.py` 同时看画面缝宽和 3D 离轴；`decide.py` 用上一趟实测的「扎过头多少」修正这一趟终点；`motion.py` 走竖直一截。`vla_end` 档这一步交给 π0.5。
+4. 对轴下探：`rulers.py` 同时看画面缝宽和 3D 离轴；`decide.py` 用上一趟实测的「扎过头多少」修正这一趟终点；`motion.py` 走竖直一截。`vla_end` 这个提前接管变体把这一步交给 π0.5。
 5. 合爪与判夹：`grasp.py` 合到压不动；`grasp_check.py` 读 6 号舵机角度，和本趟现测的空抓基准比，判 `held` / `empty`。`vla_end` 档由模型合爪，但判据仍走这里。
 6. 抬升与放置：抬到搬运高度；抓成后按坐标放到随机点，给下一集换位置，再回初始位。
 7. 安全闸：每一步自动走位前后都过 `real/safety.py`；越界立 `terminated`，这一集作废。
@@ -75,8 +75,8 @@
 | 档 | 脚本做什么 | 典型使用 |
 |---|---|---|
 | `oneshot` | 跳过合爪前微调，固定爪尖直接到计算落点 | 默认；`too_low` |
-| `full` | 画面雅可比微调 + 中心 −1 mm | `off_axis` / `no_gap` / `slip` / `too_high` / `descend_fail` |
-| `vla_end` | 脚本只到「腕子对上方块侧面」，下探、横向对齐、合爪交给 π0.5 | 需要 VLA 末段时 |
+| `full` | 准星微调：画面雅可比微调 + 中心 −1 mm | `off_axis` / `no_gap` / `slip` / `too_high` / `descend_fail` |
+| `vla_end` | 提前接管变体：脚本只到「腕子对上方块侧面」，下探、横向对齐、合爪交给 π0.5 | 需要 VLA 末段时 |
 
 失败码到下一档的映射：
 
@@ -100,14 +100,14 @@
 
 有两个接入点：
 
-- 策略表里的 `vla_end`：脚本完成「认方块 → 搬过去 → 腕子对上方块侧面」后接入，模型做下探、横向对齐、合爪。
-- 环境变量 `PICK_VLA_END=1`（旧入口）：脚本下探到底之后再接入，模型做横向纠偏、最后竖直一截、合爪。
+- 策略表里的 `vla_end`（提前接管变体）：脚本完成「认方块 → 搬过去 → 腕子对上方块侧面」后接入，模型做下探、横向对齐、合爪。
+- 环境变量 `PICK_VLA_END=1`（旧入口）：脚本对轴下探到底之后再接入，模型做横向纠偏、最后竖直一截、合爪。
 
 两条都由 `_close_and_lift(already_closed=True)` 判夹没夹住。客户端在 `_pi05_run.py` 和 `_pi05_link.py`；`skills/pick_real/vla_end.py` 负责把技能接到模型上。策略服务跑在外部 GPU 上，本机只做端口转发。
 
 ### 3.5 Qwen3-VL 判官
 
-它不是轮末的 `Judge`，而是合爪前的一次否决闸：下探到位、合爪之前，把当前帧和一张下探前参考帧交给 Qwen3-VL，问「方块还在两爪之间吗」。同一组图问两次，两次一致才算数；只有 `no` 触发「抬回悬停点、重下一次」，`yes` / `unsure` / 超时一律放行。
+它不是轮末的 `Judge`，而是合爪前的一次否决闸：下探到位、合爪之前，把当前帧和一张下探前参考帧交给 Qwen3-VL，问「方块还在两爪之间吗」。同一组图问两次，两次一致才算数；只有 `no` 触发「抬回悬停点、重下一次」，`yes` / `unsure` / 超时一律放行。重下之后的那一眼只记录，不再触发动作。
 
 它不改档位、不给偏移、不碰关节；一集仍然只合一趟爪。代码在 `ppo/vlm.py::judge`，接线在 `skills/pick_real/vlm_gate.py`；采集脚本默认接上，`--no-vlm-judge` 可关闭。
 
@@ -234,16 +234,16 @@ python collect_real_dataset.py --episodes 10 --root datasets/so101_real_grasp_2c
 先启动外部策略服务并做本机端口转发，然后：
 
 ```bash
-python _pi05_run.py --steps 200 --hz 4
+python _pi05_run.py --steps 200
 ```
 
-只让 π0.5 驱动整段。要跑「脚本对轴 + π0.5 接管末段」的一趟：
+动作块按 `--ctl-hz` 连续下发（默认 30 Hz）；`--hz` 只用于打印步频，不改变下发频率。只让 π0.5 驱动整段。要跑「脚本对轴 + π0.5 接管末段」的一趟：
 
 ```bash
 python _vla_end_try.py
 ```
 
-`configs/strategies.json` 里的 `vla_end` 就是这条路的策略条目。
+`configs/strategies.json` 里的 `vla_end` 是提前接管变体的策略条目。
 
 ### 6.5 标定
 
@@ -268,7 +268,7 @@ python _vla_end_try.py
 ### 7.2 π0.5 LoRA
 
 - 切末段：`_build_endseg.py` 从 6 号舵机第一次读到 >15° 的前 2 帧切到集尾；262 集实测中位 28 帧/集。丢掉 ep 0~19，因为那 20 集张到 99~100°，和现役 20° 上限不是同一套。
-- 训练配置：`pi05=True`、`action_horizon=10`、`paligemma_variant=gemma_2b_lora`、`action_expert_variant=gemma_300m_lora`、20k steps、恒定 lr 1e-5、batch 2；只训 LoRA adapter。
+- 训练配置：`pi05=True`、`action_horizon=10`、`paligemma_variant=gemma_2b_lora`、`action_expert_variant=gemma_300m_lora`、20k steps、恒定 lr 1e-5、AdamW 裁剪 1.0、batch 2；只训 LoRA adapter。
 - 配置片段在 `_add_endseg_cfg.py`、`_add_v2_cfg.py`，启动脚本在 `_train_pi05_v2.sh`。这些脚本里的路径是云端环境专用，公开前按环境改。
 
 ### 7.3 Qwen3-VL 判官
@@ -299,14 +299,14 @@ python _vla_end_try.py
 |---|---|
 | ![一步到位](docs/media/gifs/02-script-oneshot.gif) | **一步到位**：合爪前不做微调，爪尖直接到由方块中心算出的落点，竖直下扎、合爪、抬起。[完整 mp4](docs/media/videos/02-script-oneshot.mp4) |
 | ![先量一眼](docs/media/gifs/03-script-measure-once.gif) | **先量一眼**：下探前先在腕相机里量爪面到方块的缝，按这一眼的实测把落点修正后再下扎。[完整 mp4](docs/media/videos/03-script-measure-once.mp4) |
-| ![完整微调](docs/media/gifs/04-script-full-finetune.gif) | **完整微调**：合爪前用画面雅可比反复小幅平移，把方块推回两爪正中间再合爪。[完整 mp4](docs/media/videos/04-script-full-finetune.mp4) |
-| ![多轮微调](docs/media/gifs/05-script-finetune-multi.gif) | **多轮微调**：同一个落点连续纠偏多次，展示画面闭环在偏差较大时的收敛过程。[完整 mp4](docs/media/videos/05-script-finetune-multi.mp4) |
+| ![完整微调](docs/media/gifs/04-script-full-finetune.gif) | **完整微调**：合爪前用画面雅可比小幅平移，把方块推回两爪正中间再合爪。[完整 mp4](docs/media/videos/04-script-full-finetune.mp4) |
+| ![多轮微调](docs/media/gifs/05-script-finetune-multi.gif) | **多轮微调（历史演示）**：当时未限次，同一个落点连续纠偏 5 次，展示偏差较大时的收敛过程；现行策略的合爪前微调有次数上限（`CLEAR_MAX_MOVES`）。[完整 mp4](docs/media/videos/05-script-finetune-multi.mp4) |
 
 ### VLA 末段
 
 | 预览 | 这一段发生了什么 |
 |---|---|
-| ![腕子对齐后交给 π0.5](docs/media/gifs/06-vla-handover.gif) | **腕部对齐后交给 π0.5**：脚本先把腕子转到方块侧面的法向，π0.5 从这一帧接管下探、横向对齐和合爪。[完整 mp4](docs/media/videos/06-vla-handover.mp4) |
+| ![腕子对齐后交给 π0.5](docs/media/gifs/06-vla-handover.gif) | **腕部对齐后交给 π0.5（提前接管变体）**：脚本先把腕子转到方块侧面的法向，π0.5 从这一帧接管下探、横向对齐和合爪。[完整 mp4](docs/media/videos/06-vla-handover.mp4) |
 | ![先夹空再重夹](docs/media/gifs/07-vla-retry.gif) | **模型先夹空再重夹**：π0.5 第一次合爪夹空，6 号舵机判定为 empty 后抬回悬停点，第二次下扎才夹住。[完整 mp4](docs/media/videos/07-vla-retry.mp4) |
 
 ## 9. 已知边界
