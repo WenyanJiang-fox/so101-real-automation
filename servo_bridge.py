@@ -79,7 +79,7 @@ def open_controller(port: str = DEFAULT_PORT, baudrate: int = DEFAULT_BAUD,
 
     `fast=False`（默认）用驱动原来的两处等待：读一次约 65.8ms、写一次约 20.9ms。
     `fast=True` 把这两处去掉：读约 1.3ms、写约 0.48ms，读回值逐次相同（实测见
-    `G:\\sim2real\\so101-real-harness\\_fps_probe\\result.json`）。**只给 30fps 采集用**；
+    `G:\\sim2real\\so101-real-harness\\scripts\\probes\\fps_probe_result.json`）。**只给 30fps 采集用**；
     面板和技能走默认，行为一个数都不变。代价见驱动 `__init__` 的 `read_sleep` 注释：
     某个舵机不回应时是忙等。
     """

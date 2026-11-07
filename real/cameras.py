@@ -31,7 +31,7 @@
 **`shot()` 必须返回 RGB。** cv2 给的是 BGR，仿真那台给的是 RGB（`cam_sim.shot()`
 取的是 MuJoCo 观测）。两条路的出口必须是同一种东西，少转这一次，所有颜色判据全反。
 
-屏幕上的 `camera 1` 就是这一路（`G:\\sim2real\\so101-real-harness\\view_cam.py` 看的同一个）。
+屏幕上的 `camera 1` 就是这一路（`scripts\\calibration\\view_cam.py` 看的同一个）。
 **同一个相机开不了两次** —— 那边窗口开着的时候这边会打不开。
 """
 
@@ -46,11 +46,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# 上级目录（= 项目根）要在 sys.path 上，color_check 才导得进来 —— 直接跑本文件时
-# 也要成立，不能只依赖调用方先把路径铺好。
+# 项目根和 scripts/calibration 都要在 sys.path 上，color_check 才导得进来 ——
+# 直接跑本文件时也要成立，不能只依赖调用方先把路径铺好。
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_CALIB = _ROOT / "scripts" / "calibration"
+for _p in (_ROOT, _CALIB):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from color_check import grab_frame, open_camera          # noqa: E402
 from core.interfaces import Camera                        # noqa: E402

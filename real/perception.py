@@ -48,8 +48,10 @@ import cv2
 import numpy as np
 
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_CALIB = _ROOT / "scripts" / "calibration"
+for _p in (_ROOT, _CALIB):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from color_check import load_thresholds                    # noqa: E402
 from core import shapes, vision                            # noqa: E402
