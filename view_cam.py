@@ -14,6 +14,7 @@ import sys
 import time
 
 import cv2
+import numpy as np
 
 from color_check import open_camera, grab_frame
 
@@ -94,6 +95,19 @@ def _probe(camera: int, drain: int = 12) -> int:
     return 0
 
 
+def _rotate(img: np.ndarray, deg: float) -> np.ndarray:
+    """绕画面中心转 `deg` 度（逆时针为正），画布放大到装得下整张图，四角补黑。"""
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), deg, 1.0)
+    cos, sin = abs(M[0, 0]), abs(M[0, 1])
+    nw = int(round(h * sin + w * cos))
+    nh = int(round(h * cos + w * sin))
+    M[0, 2] += nw / 2.0 - w / 2.0
+    M[1, 2] += nh / 2.0 - h / 2.0
+    return cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+
 def _main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="实时预览 USB 相机")
@@ -103,17 +117,29 @@ def _main() -> int:
     ap.add_argument("--scale", type=float, default=4.0, help="显示放大倍数，默认 4")
     ap.add_argument("--window", default=None, help="窗口标题")
     ap.add_argument("--seconds", type=float, default=0.0, help=">0 时跑这么多秒自动退出")
+    ap.add_argument("--crop", default="",
+                    help="固定裁剪 x0,y0,x1,y1（原图坐标）；空 = 不裁")
+    ap.add_argument("--rotate", type=float, default=0.0,
+                    help="裁剪后整体转多少度（逆时针为正）；画布自动放大，不切画面")
     ap.add_argument("--probe", action="store_true", help="只问相机支持哪些分辨率，不开窗口")
     args = ap.parse_args()
+
+    crop = None
+    if args.crop.strip():
+        crop = tuple(int(v) for v in args.crop.replace(" ", "").split(","))
+        if len(crop) != 4:
+            print("--crop 要四个数：x0,y0,x1,y1")
+            return 2
+    rot = float(args.rotate)
 
     if args.probe:
         return _probe(args.camera)
 
     title = args.window or f"camera {args.camera}"
-    cap = open_camera(args.camera)
-    # 要不到就算了，能出帧就行
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    # **必须带 DSHOW 打开**（2026-10-20）：不给后端时 index 0 会落到 MSMF 上卡死 ——
+    # 同一只相机用 DSHOW 3 秒内出帧，用默认后端 90 秒一个字节都没有。分辨率也在
+    # 打开时传，打开后再 `set` 在 DSHOW 上经常返回 True 但没生效。
+    cap = open_camera(args.camera, size=(args.width, args.height), fourcc="MJPG")
 
     ok, frame = cap.read()
     if not ok or frame is None:
@@ -121,9 +147,15 @@ def _main() -> int:
         print(f"相机 index={args.camera} 打开了但读不出帧。")
         return 1
     h, w = frame.shape[:2]
-    print(f"相机 index={args.camera}：{w}x{h}，放大 {args.scale:g}x 显示。按 q 退出。")
+    note = "" if crop is None else f"，裁 {crop[2] - crop[0]}x{crop[3] - crop[1]}"
+    if rot:
+        note += f"，转 {rot:g}°"
+    print(f"相机 index={args.camera}：{w}x{h}{note}，放大 {args.scale:g}x 显示。"
+          f"按 q 退出。")
 
-    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
+    # **`WINDOW_AUTOSIZE` 在 125% 缩放的 Windows 上会把 1080p 的画面撑到屏幕外**
+    # （2026-10-20）。改成可缩放的普通窗口，尺寸就是画面本身的尺寸，用户自己能拖。
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
     t0 = time.time()
     n = 0
     best = 0.0
@@ -133,6 +165,15 @@ def _main() -> int:
             if not ok or frame is None:
                 print("读帧失败，退出。")
                 break
+            # **固定裁剪**：侧视相机只留白纸和机械臂。剪裁框写死在这里，和以后
+            # 写数据用的是同一组数（2026-10-20）。
+            if crop is not None:
+                frame = frame[crop[1]:crop[3], crop[0]:crop[2]]
+            # **转一下**：纸面和桌沿在画面里是斜的，转正了之后横竖就是场景的横竖。
+            # 画布先放大到能装下整张转完的图，四角补黑，画面内容不丢。
+            if rot:
+                frame = _rotate(frame, rot)
+
             view = frame
             if args.scale != 1.0:
                 view = cv2.resize(frame, None, fx=args.scale, fy=args.scale,
@@ -144,7 +185,25 @@ def _main() -> int:
             cv2.putText(view, f"sharp {sharp:6.1f}   best {best:6.1f}", (6, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
-            cv2.imshow(title, view)
+            # **窗口怎么拖都不变形**（2026-10-20 用户报「画面畸变」）：`WINDOW_NORMAL`
+            # 允许自由拖，OpenCV 会把画面直接拉满窗口 —— 宽高比一改就拉伸。这里按窗口
+            # 大小等比缩放、四周补黑边，画面内容一点不动。
+            rect = cv2.getWindowImageRect(title)
+            ww, wh = ((rect[2], rect[3])
+                      if rect and rect[2] > 0 and rect[3] > 0 else (0, 0))
+            shown = view
+            if ww and wh:
+                s = min(ww / view.shape[1], wh / view.shape[0])
+                nw = max(1, int(round(view.shape[1] * s)))
+                nh = max(1, int(round(view.shape[0] * s)))
+                shown = cv2.resize(view, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                if (nw, nh) != (ww, wh):
+                    canvas = np.zeros((wh, ww, 3), dtype=np.uint8)
+                    x = (ww - nw) // 2
+                    y = (wh - nh) // 2
+                    canvas[y:y + nh, x:x + nw] = shown
+                    shown = canvas
+            cv2.imshow(title, shown)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break

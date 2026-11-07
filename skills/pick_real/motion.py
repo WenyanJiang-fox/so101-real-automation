@@ -8,6 +8,7 @@ from core.params import (ALIGN_CHUNK, ALIGN_MAX_STEPS,            # noqa: E402
                          SLOW, SPEED, STUCK_TOL,
                          acc_amax, speed_vmax)
 import numpy as np
+from . import knobs as _knobs
 from .knobs import DESCEND_STEP, GAIN_MAX, GAIN_MIN_ASK_DEG, GAP_FALLBACK_MIN_COS, GAP_FALLBACK_MIN_MM_DEG, GAP_FALLBACK_POOL, REAL_GOTO_TRIES
 from .pose import _vertical
 def _joint_dir_xy(arm, q_now, j, deg: float = 1.0):
@@ -126,6 +127,8 @@ def _ik_free(arm, target_pos, target_quat, qpos0, free, ow=None, iters: int = 40
     """
     from so101_nexus.kinematics import ee_ik_delta_q, EE_IK_DAMPING   # noqa: PLC0415
 
+    from real import safety                                            # noqa: PLC0415
+    lo, hi = safety.clip_bounds(arm.q_lo, arm.q_hi)
     q = np.array(qpos0, dtype=np.float64, copy=True)
     m = np.zeros(6, dtype=bool)
     m[list(free)] = True
@@ -139,7 +142,7 @@ def _ik_free(arm, target_pos, target_quat, qpos0, free, ow=None, iters: int = 40
                            np.asarray(target_quat, dtype=np.float64),
                            orientation_weight=w, damping=EE_IK_DAMPING)
         dq[~m] = 0.0
-        q = np.clip(q + dq, arm.q_lo, arm.q_hi)
+        q = np.clip(q + dq, lo, hi)
     return q
 
 def _step_min_deg(arm, tgt, free, ow=None):
@@ -249,6 +252,7 @@ def _goto(arm, goal, *, vmax, grip=-1.0, closing=None, tol=0.004,
     不改四个调用方的签名。
     """
     from real import joint_move as jm                              # noqa: PLC0415
+    from real import safety                                        # noqa: PLC0415
 
     goal = np.asarray(goal, dtype=np.float64)
     out = "stall"
@@ -256,6 +260,9 @@ def _goto(arm, goal, *, vmax, grip=-1.0, closing=None, tol=0.004,
     # **放大可以关掉**（环境变量 `PICK_GAIN_MAX`，用户 2026-10-16：「下一步可不可以不放大」）。
     # 写 1 = 这一趟指令该动多少就动多少，不按实测比例放大。默认还是 `GAIN_MAX`（3）。
     # 关掉的代价：舵机带载只走三到五成，一趟到不了位、要几趟才挪过去；好处是不会猛拽。
+    # **2026-10-20 试过把上一趟实测的放大留给下一次走位当首趟起点，回退掉了**：
+    # 实测那一下 `collect_gain_034151.log` 补趟数 10 → 10 趟没变，抬升还冲过头
+    # （目标 80mm，走到 84.7mm 再退回来）。欠多少取决于方向和负载，不是个常数倍率。
     import os                                                   # noqa: PLC0415
 
     gmax = float(os.environ.get("PICK_GAIN_MAX", "") or GAIN_MAX)
@@ -275,6 +282,10 @@ def _goto(arm, goal, *, vmax, grip=-1.0, closing=None, tol=0.004,
         _nm = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
         print("      （只放 " + "、".join(_nm[i] for i in free) + " 动，别的钉死）")
     for k in range(tries):
+        # **停手了就不再解、不再写**（安全闸 / 时间上限都是立 `terminated`）。
+        if getattr(arm, "terminated", False):
+            out = "term"
+            break
         q_now = arm._ticks_to_qpos(arm.read_ticks())
         # **`_ik` 收的是官方 `gripperframe` 口径的位姿，`goal` 是 TCP 口径的，先换算。**
         # 两者差 `TCP_DELTA_BODY` 那 19.9mm。不换算的话解出来的是「另一个点」，手臂老老
@@ -291,12 +302,55 @@ def _goto(arm, goal, *, vmax, grip=-1.0, closing=None, tol=0.004,
         else:
             q_goal = _ik_free(arm, *arm._site_pose(goal, _q_tgt), q_now, free, ow=ow)
         q_goal[5] = (q_now[5] if grip is None
-                     else (arm.grip_hi if float(grip) > 0 else arm.grip_lo))
+                     else (getattr(arm, "grip_open", arm.grip_hi)
+                           if float(grip) > 0 else arm.grip_lo))
         # **只放大「这一趟要写下去的位移」，不动 `q_goal`。** `q_goal` 还是逆解算出来的那个
         # 点、夹爪那一维照旧取行程端点；放大的只是从此刻走到它的那一段。横向先夹到关节限位
         # 里面，免得放大把某一维推出限位（`goto_q` 不看限位，写下去就是写下去）。
-        q_cmd = np.clip(q_now + (q_goal - q_now) * gain, arm.q_lo, arm.q_hi)
+        # 放大的位移也要夹在**安全下限**里，不能只夹硬件行程：`q_goal` 已经夹过
+        # （3 号肘 ≥ +1.2°），再乘 1.3 的放大就会越过它 —— 实测 6.8° 往 1.26° 放大成
+        # −0.4°，下一行的 `check_joints` 当场立停手，整趟抬升/摆件全成了空跑。
+        _slo, _shi = safety.clip_bounds(arm.q_lo, arm.q_hi)
+        q_cmd = np.clip(q_now + (q_goal - q_now) * gain, _slo, _shi)
         q_cmd[5] = q_goal[5]
+        # **2026-10-22 试 VLM 的整改（只试这一次）**：1 号关节单步最多 `JOINT1_STEP_DEG`。
+        # 超了就按限幅值写下去，下一趟从新位置重新逆解；这样 46.5° 的一大步变成两次 23°。
+        _d1 = float(q_cmd[0] - q_now[0])
+        # 读模块属性而不是 import 进来的常量：VLM 会在运行时改这个值。
+        _lim1 = np.radians(float(_knobs.JOINT1_STEP_DEG))
+        if abs(_d1) > _lim1:
+            q_cmd[0] = q_now[0] + np.sign(_d1) * _lim1
+            print(f"      （1 号关节限幅：{np.degrees(_d1):.1f}° → "
+                  f"{np.degrees(_lim1):.1f}°，剩下下一趟再走）")
+        # **其它关节的单步上限**（2026-10-22）：默认 `None` = 不额外限，三档策略
+        # 走的还是原来那条路；只有 VLM 在安全闸之后给了 `step_deg` 才生效。
+        # 做法和 1 号那条一样：超了按上限写下去，下一趟从新位置重新逆解。
+        # **只在会重解的那条路上限**（`tries > 1`）。`tries=1` 的调用（竖直下探
+        # 那一下）本来就只解一次、不补第二趟：限了它只会停在半路，判据当场报
+        # 「没到底」。2026-10-22 实测过这一版：2 号 39.2° 被压到 30°，只走了
+        # 13mm/23.5mm。
+        _lim_any = getattr(_knobs, "JOINT_STEP_DEG", None)
+        if _lim_any and tries > 1:
+            _la = np.radians(float(_lim_any))
+            _da = q_cmd - q_now
+            _da[5] = 0.0
+            _hit = np.where(np.abs(_da) > _la)[0]
+            if _hit.size:
+                q_cmd[_hit] = q_now[_hit] + np.sign(_da[_hit]) * _la
+                print("      （关节单步限幅 "
+                      + f"{float(_lim_any):.0f}°："
+                      + "、".join(f"{int(i) + 1} 号 {np.degrees(_da[i]):.1f}°"
+                                  for i in _hit) + "）")
+        # **写之前拦一道**（用户 2026-10-20：「机械臂姿态偏离太多」）：一步要动多少度
+        # 是有上限的，超了就不写、直接停手。上限和来历见 `real/safety.py` 开头。
+        if safety.check_step(arm, q_now, q_cmd):
+            out = "safety"
+            break
+        # **2 号肩抬的绝对下限**（2026-10-24 用户定）：后仰不许比初始位置更激进。
+        # 这一步和上面那条是两维：单步闸看「一次动多少」，这条看「绝对到哪」。
+        if safety.check_joints(arm, q_now, q_cmd):
+            out = "safety"
+            break
         print(f"      走位（关节空间）第 {k + 1} 趟：{np.round(arm.tcp() * 1000, 1)}mm"
               f" → {np.round(goal * 1000, 1)}mm   要动 "
               f"{np.round(np.degrees(np.abs(q_cmd - q_now)), 1)} 度")
@@ -311,6 +365,10 @@ def _goto(arm, goal, *, vmax, grip=-1.0, closing=None, tol=0.004,
         err = float(np.linalg.norm(goal - arm.tcp()))
         print(f"        走到 {np.round(arm.tcp() * 1000, 1)}mm  差 {err * 1000:.1f}mm"
               f"  关节 {np.round(arm.angles(), 1)}")
+        # **走完再看一眼整条臂在哪儿**：单步没超、几趟叠起来跑到工作区外一样要停。
+        if safety.check_pose(arm, f"走位第 {k + 1} 趟之后"):
+            out = "safety"
+            break
         # **一趟不够。** `goto_q` 收尾只是把同一个目标角连发几遍，舵机在重力负载下欠的
         # 那一截没人补：实测（COM10 从臂，2026-10-14，进场 [227, 68, 81]mm）第一趟走到
         # 差 13.0mm，读回来 3 号 16.4°、4 号 81.3°，而指令是 14.5°、80.0° —— 各欠
@@ -351,6 +409,39 @@ def _goto(arm, goal, *, vmax, grip=-1.0, closing=None, tol=0.004,
     arm._grip_cmd = float(arm.grip_q())
     return out
 
+# 够不着时降高度再走的两个数。低于 5mm 的差不算「够不着」（`_goto` 自己的 tol 是 4mm，
+# 舵机 2° 死区那一档也在这个量级）；一次最多降两轮，降不下来就照旧收工。
+REACH_SHORT_TOL = 0.005
+REACH_LOWER_TRIES = 2
+
+def _goto_reach(arm, goal, *, vmax, floor_z, **kw) -> tuple[str, np.ndarray]:
+    """`_goto` 走不到就**降低高度再走**。返回 `(结果, 最后用的目标点)`。
+
+    远处的点在高处够不着：`out/panel_20261020_ppo3.log` 纠位那一趟（目标
+    [252.8 19.2 70.0]mm）走了四趟停在 [248.5 20.9 61.8]mm，差 9.4mm；同一趟下探到
+    z≈18mm 时同样的水平距离是够得着的 —— 臂伸得越长，能到的高度越低。用户 2026-10-20：
+    「2 号舵机稍微开大一点，就能让整个机械臂有更长的抓取范围，只不过起始高度更低罢了」。
+
+    降多少用**实测的水平差**，不按系数猜。最低降到 `floor_z`（调用方给：盒子中心 +
+    `APPROACH_MIN_ABOVE_M`），再低就没给下探留出空间。
+    """
+    p = np.asarray(goal, dtype=np.float64).copy()
+    out = "stall"
+    for _ in range(REACH_LOWER_TRIES + 1):
+        out = _goto(arm, p, vmax=vmax, **kw)
+        if out != "stall" or getattr(arm, "terminated", False):
+            return out, p
+        short = float(np.linalg.norm(np.asarray(arm.tcp(), dtype=np.float64)[:2] - p[:2]))
+        if short <= REACH_SHORT_TOL:
+            return out, p
+        new_z = max(float(p[2]) - short, float(floor_z))
+        if new_z >= float(p[2]) - 1e-6:
+            return out, p
+        print(f"    ↕ 这个高度上够不着（水平还差 {short * 1000:.1f}mm）—— "
+              f"高度降 {(p[2] - new_z) * 1000:.1f}mm 再走，降到 {new_z * 1000:+.1f}mm")
+        p = np.array([p[0], p[1], new_z], dtype=np.float64)
+    return out, p
+
 def _descend(arm, xy, z_top, z_bot, *, closing=None, open_at=0.5, step=DESCEND_STEP,
              tol=0.004) -> tuple[str, np.ndarray]:
     """从 `z_top` 垂直降到 `z_bot`：整根柱子上每一点都对准同一个 `xy`、同一个朝向。
@@ -388,6 +479,7 @@ def _descend(arm, xy, z_top, z_bot, *, closing=None, open_at=0.5, step=DESCEND_S
     欠 1.9°、4 号欠 1.3°），从**走到的**姿态重解整列能把这一截补回来一点。
     """
     from real import joint_move as jm                              # noqa: PLC0415
+    from real import safety                                        # noqa: PLC0415
 
     xy = np.asarray(xy, dtype=np.float64).reshape(2)
     q_before = arm.quat()                  # TCP 口径；`_site_pose` 会换算成官方口径
@@ -440,11 +532,26 @@ def _descend(arm, xy, z_top, z_bot, *, closing=None, open_at=0.5, step=DESCEND_S
         if worst > tol:
             print(f"        ✗ 这条列解不到：最大欠 {worst * 1000:.1f}mm，不走")
             return "stall", arm.tcp()
+        # **写之前过同一道安全闸**（见 `real/safety.py`）。
+        if safety.check_step(arm, q_list[0], q_list[-1]):
+            return "safety", arm.tcp()
+        # 这一列是**一次解好、中途不再读**的，2 号肩抬的绝对下限得逐点看：
+        # 起点、终点都在限制内、中间某一点越过去，一样会把臂带出去。
+        _worst = min(q_list, key=lambda q: float(q[1]))
+        if safety.check_joint_abs(arm, _worst):
+            return "safety", arm.tcp()
+        # 3 号肘同样逐点看，取整列里**折得最狠**的那一点：起点终点都合规、中间某点
+        # 越过 75° 夹角，一样会把臂折进去。
+        _fold = min(q_list, key=lambda q: float(q[2]))
+        if safety.check_joint_abs(arm, _fold):
+            return "safety", arm.tcp()
         # 中间那几趟短收尾，最后一趟照旧 —— 理由和 `_goto` 同。
         last = k == REAL_GOTO_TRIES - 1
         jm.goto_path(arm, q_list,
                      **({} if last else {"settle": 0.15, "hold": 3}))
         tcp = arm.tcp()
+        if safety.check_pose(arm, f"下探第 {k + 1} 趟之后"):
+            return "safety", tcp
         err = float(np.linalg.norm(goal_bot - tcp))
         print(f"        走到 {np.round(tcp * 1000, 1)}mm  差 {err * 1000:.1f}mm"
               f"  关节 {np.round(arm.angles(), 1)}")

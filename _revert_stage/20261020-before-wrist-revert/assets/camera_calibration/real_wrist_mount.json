@@ -1,0 +1,60 @@
+{
+ "_note": "real/calib_views.py 采图 + calibrate_handeye.py 解。R_cam2gripper/t_cam2gripper 是 cv2.calibrateHandEye 的输出，gripper 系 = MJCF 的 gripperframe site。",
+ "method": "DANIILIDIS",
+ "R_cam2gripper": [
+  [
+   -0.026904438150495834,
+   0.25172752721149094,
+   0.9674241072310502
+  ],
+  [
+   0.008447493092892944,
+   0.967797128755938,
+   -0.25158966082136186
+  ],
+  [
+   -0.9996023164580262,
+   0.0014034299948598727,
+   -0.028164504540251656
+  ]
+ ],
+ "t_cam2gripper": [
+  -0.10543472972940762,
+  0.0707602730159358,
+  0.011115592949608198
+ ],
+ "intrinsics_from": "real_wrist.json",
+ "square_m": 0.028,
+ "n_views": 11,
+ "views": [
+  "calibview_043.jpg",
+  "calibview_044.jpg",
+  "calibview_045.jpg",
+  "calibview_046.jpg",
+  "calibview_047.jpg",
+  "calibview_048.jpg",
+  "calibview_049.jpg",
+  "calibview_050.jpg",
+  "calibview_051.jpg",
+  "calibview_052.jpg",
+  "calibview_053.jpg"
+ ],
+ "validated": {
+  "target_pos_in_base_m": [
+   0.44185681033976126,
+   -0.0009387830788975947,
+   -0.00806384436649491
+  ],
+  "resid_mm_max": 4.180574200695849,
+  "resid_mm_rms": 1.8490153657458799,
+  "resid_deg_max": 0.8247117379674826,
+  "all_methods_mm_max": {
+   "TSAI": 0.00419448852943931,
+   "PARK": 0.0042347485382340936,
+   "HORAUD": 0.004229459906906098,
+   "ANDREFF": 0.07777143966241122,
+   "DANIILIDIS": 0.004180574200695849
+  }
+ },
+ "_calibrated_at": "2026-10-14"
+}

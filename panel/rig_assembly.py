@@ -58,7 +58,8 @@ class AssemblyMixin:
                   f"感知 {available('perception')}")
 
         self.arm = make("arm", "real", port=self.port,
-                        speed=int(rig.get("speed", 0)))
+                        speed=int(rig.get("speed", 0)),
+                        fast=bool(rig.get("fast", False)))
         self.arm.on_step = self._on_step
         self.arm.terminated = False
         self.cams = {"real_wrist": make("camera", "real_wrist", source=self.arm,
@@ -82,6 +83,29 @@ class AssemblyMixin:
             self._log(f"！爪轮廓读不出来：{exc}")
         self._log(f"串口 {self.port}   腕相机 index {self.cam_index} "
                   f"({self.cam.size()[0]}x{self.cam.size()[1]})   认的颜色 {self.color}")
+
+        # **侧相机**（2026-10-20）：只给采集那一路用，感知和画面都不碰它。打不开就
+        # 记下来、`side = None` —— 面板照常能用，只是「采集」那个按钮会拒绝开始
+        # （见 `rig.py::_collect_on`）：少一路相机的数据集是另一份格式，不能混着录。
+        self.side = None
+        side_cfg = (cfg.get("collect") or {}).get("side_cam") or {}
+        if side_cfg:
+            try:
+                from real.side_cam import SideCamera                # noqa: PLC0415
+
+                self.side = SideCamera(index=int(side_cfg.get("index", 0)),
+                                       crop=side_cfg.get("crop"),
+                                       rotate=float(side_cfg.get("rotate", 0.0)))
+                self._log(f"侧相机 index {side_cfg.get('index', 0)}："
+                          f"{self.side.size()[0]}x{self.side.size()[1]}"
+                          f"（裁 {(side_cfg.get('crop') or [])}，"
+                          f"转 {side_cfg.get('rotate', 0)}°）")
+            except Exception as exc:                                # noqa: BLE001
+                self._log(f"！侧相机打不开（{type(exc).__name__}: {exc}），"
+                          f"这一版只能录腕相机；要采集先把它弄好")
+        if self.side is not None:
+            # `PICK_VLA_END=1` 时技能从 `cams` 拿这一路（末端那一段的第二个视角）
+            self.cams["side"] = self.side
 
         self._snap = self._fresh_snapshot()
         self._phase = None

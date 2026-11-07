@@ -25,6 +25,13 @@ import real.arm as RA                                             # noqa: E402
 from panel.rig_common import DEFAULT_CONFIG, load_cfg             # noqa: E402
 
 FALLBACK6 = 1434          # 6 号读不到时的回退值（只给 read_ticks 兜底）
+# **张开目标（度，qpos 口径）。** 2026-10-21 用户定：任何时候张开都不许超过 20°
+# （`grip_hi` = 100.0° 不许可达）。命令行给一个数就覆盖，但写下去前会夹到 20°。
+OPEN_DEG = 20.0
+OPEN_CEIL_DEG = float(RA.GRIP_OPEN_DEG)
+if len(sys.argv) > 1:
+    OPEN_DEG = float(sys.argv[1])
+OPEN_DEG = min(OPEN_DEG, OPEN_CEIL_DEG)
 
 cfg = load_cfg(DEFAULT_CONFIG)
 rig = cfg["real"]
@@ -42,10 +49,10 @@ try:
     print(f"[开爪] 写前读数：{now}", flush=True)
 
     q = arm._ticks_to_qpos(arm.read_ticks())
-    q[5] = float(arm.grip_hi)
+    q[5] = float(np.clip(np.radians(OPEN_DEG), arm.grip_lo, arm.grip_open))
     tgt = arm._qpos_to_ticks(q)
-    print(f"[开爪] 6 号目标：{tgt[6]} 刻（张开端 "
-          f"{np.degrees(arm.grip_hi):.1f}°）", flush=True)
+    print(f"[开爪] 6 号目标：{tgt[6]} 刻（张到 {np.degrees(q[5]):.1f}° / "
+          f"上限 {np.degrees(arm.grip_hi):.1f}°）", flush=True)
 
     for i in range(15):
         arm.ctrl.sync_set_positions({6: int(tgt[6])}, 0)

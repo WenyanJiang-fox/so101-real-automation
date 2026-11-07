@@ -60,7 +60,8 @@ print("ONE-SHOT：跳过合爪前微调，固定爪尖直接到算出来的落�
 print("=" * 66, flush=True)
 
 arm = make("arm", "real", port=str(rig.get("port", "COM10")),
-           speed=int(rig.get("speed", 0)))
+           speed=int(rig.get("speed", 0)),
+           fast=bool(rig.get("fast", False)))
 arm.terminated = False
 cams = {"real_wrist": make("camera", "real_wrist", source=arm,
                            index=int(rig.get("cam_index", 0)))}

@@ -1,145 +1,315 @@
-# SO-101 真机 harness（初代）
+# SO-101 真机抓放：脚本技能 + π0.5 末端策略 + Qwen3-VL 判官
 
-## 这个目录是什么
+在 SO-101 六轴机械臂上跑通真机抓取—放置：脚本负责几何对轴，π0.5 LoRA 接管末段，Qwen3-VL 在合爪前做否决。无人值守采集 6 小时产出 120 条、有效率 68%；加入 VLA 末段后单趟平均 100 s → 43 s，抓取成功率 83%。
 
-真机上两个判定模块 + 它们的标定脚本：
+## 1. 项目简介
 
-- **模块 A**：靠 6 号舵机（夹爪）的角度判断「夹住了没有」，以及抬起过程中「掉没掉」。
-- **模块 B**：从一张腕部相机图里判断「夹住的是红 / 绿 / 蓝哪个」。
+这是一个真机抓取 harness，不是只跑仿真的 demo。它把一条抓取拆成五个可替换的零件：机械臂、相机、策略、判官、技能；主循环只认接口，换实现只改 `configs/` 里一行。
 
-两个模块都是**纯阈值、纯白盒**的：没有神经网络，没有大模型，每一步的中间量都能打印出来手工核对。
+核心取舍是「脚本保底、模型只接一小段」：
 
-**和 `G:\sim2real\so101-smolvla-sim`（仿真 + SmolVLA 训练那套）完全分开，互不引用。** 本目录不读那边的任何文件。
+- 脚本技能负责可解释的部分：回位、悬停、转腕对轴、下探、合爪、抬升、放置。
+- π0.5 只接最后一段（横向对齐、下探、合爪）；模型只出动作，成败仍由脚本判。
+- Qwen3-VL 只做合爪前的否决，不指挥机械臂，也不参与轮末成败判定。
+- 失败按失败码归因，三档策略按码路由；失败样本回流成 VLM 判官的训练对。
 
-## 现在到哪一步了
+同一套接口也能在 MuJoCo 里跑（`run_sim.py`），用于对照脚本策略和仿真真值判官。
 
-- 设计定了，5 个脚本写完，**只做了语法检查**（`py_compile` 通过）。
-- **一行都没在真机上跑过，逻辑路径也没执行过。**
-- `thresholds.json` 全是 `null`。两个模块在没标定时会**直接抛异常拒绝工作**，这是故意的 —— 不猜阈值。
+## 2. 核心结果
 
-## 硬件前提
-
-### 已核实（读的是 `G:\sim2real\mcp_robot\sources\servo_control_standalone.py`）
-
-| 项 | 位置 | 内容 |
-|---|---|---|
-| 构造 | L289 | `ServoControllerStandalone(port_name="COM4", baudrate=1000000, timeout=0.1, debug=False)` |
-| 发角度 | L456 | `set_servo_angle(servo_id, angle, speed=0)`，angle 0–180，speed=0 是最高速 |
-| 读角度 | L499 | `get_servo_angle(servo_id)` → 0–180 或 `None` |
-| 读原始值 | L557 | `read_position(servo_id)` → 0–4095 或 `None` |
-| 批量读 | L543 / L668 | `read_positions(ids)` / `sync_read_positions(ids)` |
-| 扭力 | L804 / L816 / L828 / L865 | `enable_torque` / `disable_torque` / `sync_enable_torque` / `sync_disable_torque` |
-| 回原点 | L902 | `go_home(speed=0)` |
-| 地址常量 | L285 | **只读了 `ADDR_PRESENT_POSITION = 56`。负载 / 电流寄存器没读** |
-
-舵机 → 关节映射（全项目一致）：`1=shoulder_pan, 2=shoulder_lift, 3=elbow_flex, 4=wrist_flex, 5=wrist_roll, 6=gripper`。
-
-### 未核实（接手的人必须先确认，别当成前提）
-
-1. **真机相机怎么取帧。** 整个仓库里没找到真机 USB 相机的代码 —— `G:\sim2real\mcp_robot\sources\view_wrist_cam.py` 走的是 MuJoCo 的 `render_observation`，是仿真的。`color_check.py` 默认用 `cv2.VideoCapture(index)`，也可以 `--image` 喂文件。**真机走哪条路要你定**，定完可能要改 `open_camera`。
-2. **夹爪角度的方向。** 「0° = 合到底（爪面约 30.9 mm），180° = 全开（约 55.9 mm）」来自用户实测（memory `so101-gripper-jaw-travel`），**本目录没有在真机上验证过**。第一次跑 `python grasp_check.py --watch` 时手动开合一下爪子，确认方向对不对。
-3. **抓起来之后方块在不在腕机画面里。** 这决定模块 B 能不能用。腕机装在腕上看前方，方块夹在爪子正下方，很可能落在画面下缘，或者被爪子挡住。**先拍一张「夹住举起来」的图看看。** 如果看不到，就得改在抬到高位的瞬间读，或者调相机角度。
-4. 方块尺寸、颜色饱和度、桌面背景色 —— 都影响阈值，全部靠标定步骤解决，不要在代码里猜。
-
-## 文件
-
-| 文件 | 干什么 |
+| 维度 | 结果 |
 |---|---|
-| `G:\sim2real\so101-real-harness\servo_bridge.py` | 把 `mcp_robot` 的舵机驱动引进来，加中位数滤波的读法。**唯一一个知道驱动在哪的文件。** |
-| `G:\sim2real\so101-real-harness\grasp_check.py` | 模块 A：`classify()` + `GraspMonitor` + 命令行 |
-| `G:\sim2real\so101-real-harness\color_check.py` | 模块 B：HSV 分割 + 通道排序交叉验证 + 命令行 |
-| `G:\sim2real\so101-real-harness\calibrate_grasp.py` | 跑真机采两组角度，算阈值写回 json |
-| `G:\sim2real\so101-real-harness\calibrate_color.py` | 喂样本图，算 HSV 区间写回 json |
-| `G:\sim2real\so101-real-harness\thresholds.json` | 唯一的阈值来源。标定产物写这里 |
+| 数据采集 | 4 Hz、腕 + 侧双相机；无人值守连续采集 6 小时，产出 120 条，有效率 68% |
+| 失败归因 | 7 类失败码：`off_axis` / `too_low` / `too_high` / `no_gap` / `slip` / `descend_fail` / `other` |
+| 末端策略 | π0.5 LoRA（仅 adapter，`action_horizon=10`） |
+| 端到端 | 脚本对轴 + π0.5 接管末段（下探 / 横向对齐 / 合爪）：单趟平均 100 s → 43 s，抓取成功率 83% |
+| 策略路由 | 三档 `oneshot` / `full` / `vla_end`，按失败码自动路由 |
+| VLM 判官 | Qwen3-VL LoRA r16/α32；6 类失败场景 300 条成对训练，280 条评测二分类准确率 92.9% |
 
-## 接口
+表中的端到端时间、成功率、采集条数和有效率来自真机实测汇报口径；其余数字可以在代码与配置里对到。有效率 = 判 `held` 并写进数据集的集数占全部采集集数的比例；没抓成的整集丢弃。
 
-```python
-# 模块 A
-from grasp_check import load_thresholds, classify, GraspMonitor
-cal = load_thresholds()
-classify(angle_deg, cal) -> "held" | "empty" | "unclear" | "no-reading"
+## 3. 方法与流水线
 
-m = GraspMonitor(controller, cal)
-m.mark_peak()      # 抬起之前调一次，记基准
-m.poll()           # 抬起过程中每 0.2 秒左右调一次
-m.dropped()        # True / False / None（信息不够）
+### 3.1 五接口
 
-# 模块 B
-from color_check import which_color, color_ratios, channel_order_guess
-which_color(frame_bgr, cal)        -> ("red", {"red":0.42,"green":0.03,"blue":0.01})
-channel_order_guess(frame_bgr, cal) -> ("red", {"blue":..,"green":..,"red":..})
+`core/interfaces.py` 定义了 6 个抽象基类。对外按五块讲：臂、相机、策略、判官、技能；感知单独列为第六块，因为它也需要独立替换。
 
-# 工具
-from servo_bridge import open_controller, read_gripper_deg, close_gripper, open_gripper
+| 零件 | 职责 | 现有实现 |
+|---|---|---|
+| 机械臂 `Arm` | 动：读 TCP、朝目标走一小步、读关节角/接触 | `impls/arm_sim.py`、`real/arm.py` |
+| 相机 `Camera` | 看：给一帧、给尺寸、给机位/内参 | `impls/cam_sim.py`、`real/cameras.py`、`real/side_cam.py` |
+| 感知 `Perceptor` | 认：按指令找目标并给出世界坐标 | `impls/perception.py`、`real/perception.py` |
+| 策略 `Policy` | 决定顺序：一次给一串动作 | `impls/policy_expert.py`、`impls/policy_real.py` |
+| 判官 `Judge` | 轮末判成败 | `impls/judge_truth.py`、`impls/judge_grasp.py`、`impls/judge_held.py` |
+| 技能 `Skill` | 干一件小事：抓/放/回位/安全检查 | `skills/pick.py`、`skills/pick_real/` |
+
+装配由 `core/registry.py` 的「名字 → 类」表和 `configs/*.yaml` 完成。换实现只改配置里那一行。
+
+### 3.2 一次抓取的执行顺序
+
+```
+腕相机 / 侧相机
+      │
+      ▼
+感知：HSV 找目标色块 → 矩形度过滤 → 内参 + 手眼反投影 → 中心 / 朝向 / 尺寸
+      │
+      ▼
+脚本技能：回位 → 悬停 → 转腕对轴 → 竖直下探 → 合爪 → 抬升 → 放置
+      │                                   │
+      │                                   └─ vla_end：下探 / 横向对齐 / 合爪交给 π0.5
+      ▼
+判官：6 号舵机角度（held / empty） + 轮末 Judge
 ```
 
-## 怎么标定
+1. 回初始位：`home_real` 把六轴回到 `real_home.RAW_HOME`，腕相机正对桌面。
+2. 看一眼：`real/perception.py` 用 HSV 找目标色块，用矩形填充率过滤同色杂物；`core/vision.py` 用相机内参和手眼标定把像素反推到基座系，估中心、朝向和尺寸。
+3. 进场与转腕：`skills/pick_real/motion.py` 走到悬停点；`align.py` 把合爪轴（工具 x 轴）转到方块侧面法向。
+4. 对轴下探：`rulers.py` 同时看画面缝宽和 3D 离轴；`decide.py` 用上一趟实测的「扎过头多少」修正这一趟终点；`motion.py` 走竖直一截。`vla_end` 档这一步交给 π0.5。
+5. 合爪与判夹：`grasp.py` 合到压不动；`grasp_check.py` 读 6 号舵机角度，和本趟现测的空抓基准比，判 `held` / `empty`。`vla_end` 档由模型合爪，但判据仍走这里。
+6. 抬升与放置：抬到搬运高度；抓成后按坐标放到随机点，给下一集换位置，再回初始位。
+7. 安全闸：每一步自动走位前后都过 `real/safety.py`；越界立 `terminated`，这一集作废。
 
-用 `G:/anaconda/envs/sim2real/python.exe`。
+### 3.3 三档策略与失败码路由
 
-**第 1 步：夹爪。** 会动真机（发合爪指令），跑之前确认爪里不会夹到线或桌面、串口没被 `mcp_server.py` 占着。
+`configs/strategies.json` 是策略的唯一来源。三档不是三份技能，而是同一份 `pick_real` 的三组参数覆盖：
 
-```powershell
-cd G:\sim2real\so101-real-harness
-G:/anaconda/envs/sim2real/python.exe calibrate_grasp.py --port COM12 --seconds 4
+| 档 | 脚本做什么 | 典型使用 |
+|---|---|---|
+| `oneshot` | 跳过合爪前微调，固定爪尖直接到计算落点 | 默认；`too_low` |
+| `full` | 画面雅可比微调 + 中心 −1 mm | `off_axis` / `no_gap` / `slip` / `too_high` / `descend_fail` |
+| `vla_end` | 脚本只到「腕子对上方块侧面」，下探、横向对齐、合爪交给 π0.5 | 需要 VLA 末段时 |
+
+失败码到下一档的映射：
+
+| 失败码 | 典型含义 | 下一档 |
+|---|---|---|
+| `off_axis` | 合爪轴偏离 | `full` |
+| `too_low` | 下探过深 | `oneshot` |
+| `too_high` | 下探过浅 | `full` |
+| `no_gap` | 爪面没有缝 | `full` |
+| `slip` | 没夹住 / 抬起来掉了 | `full`；同一档先按实测再扎一趟 |
+| `descend_fail` | 下探没走成 | `full` |
+| `other` | 其他 | 按阶梯取未试过的一档；都试过就停 |
+
+`no_detect`（没认出来）是停止条件，不进重试。路由代码在 `skills/pick_real/strategy.py::code()` / `next_after()`；面板的连续抓取用它换档。
+
+无人值守采集另有 `ppo/policy.py` 的重试账本：`baseline` / `no_measure` / `full` 三组参数，每次只换一个变量，全部试过后回到实测开口最大的一档。它只吃技能交回的实测数，不碰硬件。
+
+### 3.4 π0.5 末端策略
+
+π0.5 只做末段。观测是腕相机 + 侧相机两路图，动作是 6 个关节的目标角，一次输出 10 步的 action chunk（`action_horizon=10`）。训练只更新 LoRA adapter（`gemma_2b_lora` + `gemma_300m_lora`），基座权重冻结。
+
+有两个接入点：
+
+- 策略表里的 `vla_end`：脚本完成「认方块 → 搬过去 → 腕子对上方块侧面」后接入，模型做下探、横向对齐、合爪。
+- 环境变量 `PICK_VLA_END=1`（旧入口）：脚本下探到底之后再接入，模型做横向纠偏、最后竖直一截、合爪。
+
+两条都由 `_close_and_lift(already_closed=True)` 判夹没夹住。客户端在 `_pi05_run.py` 和 `_pi05_link.py`；`skills/pick_real/vla_end.py` 负责把技能接到模型上。策略服务跑在外部 GPU 上，本机只做端口转发。
+
+### 3.5 Qwen3-VL 判官
+
+它不是轮末的 `Judge`，而是合爪前的一次否决闸：下探到位、合爪之前，把当前帧和一张下探前参考帧交给 Qwen3-VL，问「方块还在两爪之间吗」。同一组图问两次，两次一致才算数；只有 `no` 触发「抬回悬停点、重下一次」，`yes` / `unsure` / 超时一律放行。
+
+它不改档位、不给偏移、不碰关节；一集仍然只合一趟爪。代码在 `ppo/vlm.py::judge`，接线在 `skills/pick_real/vlm_gate.py`；采集脚本默认接上，`--no-vlm-judge` 可关闭。
+
+### 3.6 无人值守采集与安全闸
+
+`collect_real_dataset.py` 的一集是：回家（不录）→ `pick_real` 走一趟（录）→ 判 `held` 才写盘。没抓成的整集丢掉，但失败码、原图、实测数留在 `out/` 供归因。抓成后技能自己把方块摆到随机点，给下一集换位置。
+
+停止只走 `out/STOP` 文件，避免硬杀进程截断 parquet。`out/` 每次启动会按天数清理。
+
+安全闸的阈值都按实测取：单步单关节 45°、TCP 包络半径 300 mm / z −30~200 mm、2 号肩抬 ≥ −45°、3 号肘两臂夹角 ≥ 75°。触发即停手，这一集作废；现场交 VLM 存档，随后回初始位继续下一集。
+
+## 4. 目录结构
+
+```
+so101-real-harness/
+├─ core/                    五接口、记录/注册表、几何/视觉/轨迹
+│  ├─ interfaces.py         Arm / Camera / Perceptor / Policy / Judge / Skill
+│  ├─ types.py              Round / Verdict（一轮唯一记录形状）
+│  ├─ registry.py           名字 → 实现
+│  ├─ follow.py             笛卡尔跟踪
+│  ├─ trajectory.py         toppra 时间最优轨迹
+│  ├─ geom.py / shapes.py   工位几何、形状表
+│  ├─ vision.py             从腕相机量位置/朝向
+│  ├─ params.py             速度/高度/夹持力参数
+│  ├─ round_state.py        一轮内技能间共享状态
+│  └─ blind.py              仿真盲测
+├─ impls/                   接口的仿真/真机实现
+│  ├─ arm_sim.py / cam_sim.py
+│  ├─ arm_sim_real.py       真机代码跑在仿真臂上
+│  ├─ perception.py
+│  ├─ policy_expert.py / policy_real.py
+│  └─ judge_truth.py / judge_grasp.py / judge_held.py
+├─ skills/                  小模块
+│  ├─ pick.py / place.py / home.py / sweep.py   仿真技能
+│  └─ pick_real/            真机抓取技能：编排、运动、对齐、合爪、失败码、策略
+├─ panel/                   tkinter 真机面板：画面、按钮、断点、连续采集
+├─ real/                    真机硬件层：串口臂、相机、感知、录制、安全闸、侧相机
+├─ ppo/                     重试账本、定位守卫、VLM 诊断/判官
+├─ configs/                 装配配置（default / real / sim_real）+ 三档策略表
+├─ assets/                  相机标定、标定板
+├─ docs/                    接口说明、面试论文清单、演示媒体
+├─ datasets/                LeRobot 数据集（按环境生成，不随仓库发布）
+├─ collect_real_dataset.py  真机无人值守采集入口
+├─ run_sim.py               MuJoCo 主循环入口
+├─ _pi05_run.py             π0.5 推理入口
+├─ _vla_end_try.py          脚本 + π0.5 末段的一趟演示
+├─ servo_bridge.py          Feetech 舵机驱动桥
+├─ real_home.py             真机初始点位
+├─ grasp_check.py           6 号舵机夹持判据
+└─ thresholds.json          HSV / 夹爪阈值
 ```
 
-它会让你做两次采样：先空抓，再夹住方块举起来。**连续跑 2~3 遍**，看两次算出的阈值差多少。差得多说明夹爪重复性不够，把 `--margin` 调大。
+## 5. 环境依赖
 
-**第 2 步：三个颜色。** 每个颜色采 20 张左右。
+### 软件
 
-```powershell
-G:/anaconda/envs/sim2real/python.exe calibrate_color.py --color red  --camera 0 --n 20
-G:/anaconda/envs/sim2real/python.exe calibrate_color.py --color green --camera 0 --n 20
-G:/anaconda/envs/sim2real/python.exe calibrate_color.py --color blue --camera 0 --n 20
+开发环境是 Windows 10/11 + Python 3.12。主要依赖：
+
+- `numpy`、`opencv-python`、`scipy`、`toppra`、`mujoco`、`PyYAML`、`Pillow`
+- `lerobot==0.6.1`（数据集读写）
+- `websockets` + `openpi_client`（π0.5 客户端）
+- `pyserial`（Feetech 总线，经外部驱动）
+- `so101_nexus`（运动学、归一化和 MuJoCo 抓取环境）
+- `tkinter`（Windows Python 自带，面板用）
+- `pandas`、`pyav`（只在切数据集/统计时用）
+- `paramiko`（只在 SSH 端口转发脚本里用）
+- `torch` / `transformers` / `ms-swift`（只在 Qwen3-VL 训练/部署时用）
+
+仓库的 `requirements.txt` 列出主循环所需依赖；`openpi_client`、`so101_nexus`、Qwen3-VL 权重不在 PyPI，按下一节的说明单独准备。
+
+### 外部仓库与模型
+
+以下都不在本仓库内，路径需要按环境配置：
+
+- `SO-ARM100` 的 MuJoCo 模型 `so101_new_calib.xml`：`real/arm.py` 用它做正解。
+- Feetech 舵机驱动 `servo_control_standalone.py`：`servo_bridge.py` 把它加进 `sys.path`。
+- `so101_nexus`：仿真环境和运动学工具。
+- openpi：π0.5 策略服务；仓库只含客户端。
+- Qwen3-VL + ms-swift：判官训练和 OpenAI 兼容部署。
+
+### 硬件
+
+- SO-101 从臂，6 个 Feetech SCS 舵机，USB 串口总线。
+- 腕部 USB 相机（原生 1920×1080；数据里存 960×540）。
+- 可选侧视 USB 相机：只进数据、不参与抓取；双相机数据集需要它。
+- π0.5 和 Qwen3-VL 需要外部 GPU；本地脚本和面板不需要 GPU。
+
+## 6. 如何运行
+
+以下命令都在仓库根目录执行；`python` 指装有上述依赖的解释器。
+
+### 6.1 仿真自检
+
+```bash
+python run_sim.py --config configs/default.yaml --rounds 2 --seed 0
 ```
 
-或者先存图再标（推荐，可以反复试）：
+默认配置用 `siglip2` 感知；没有模型权重时，把 `configs/default.yaml` 的 `perception` 改成 `nearest`（不依赖模型）。仿真需要 `so101_nexus` 和 `SO-ARM100` 模型路径可用。
 
-```powershell
-G:/anaconda/envs/sim2real/python.exe color_check.py --camera 0 --n 20 --save G:\sim2real\so101-real-harness\samples\red
-G:/anaconda/envs/sim2real/python.exe calibrate_color.py --color red --images "G:\sim2real\so101-real-harness\samples\red\*.jpg"
+### 6.2 真机面板
+
+```bash
+python -m panel
 ```
 
-**第 3 步：验证。**
+面板是一个原生 tkinter 窗口：左侧腕相机画面、右侧按钮和读数。F1 跑一趟，F6 开关连续采集。串口、相机序号、桌面高度、感知偏移都在 `configs/real.yaml` 里，按机器修改。
 
-```powershell
-G:/anaconda/envs/sim2real/python.exe grasp_check.py --check
-G:/anaconda/envs/sim2real/python.exe color_check.py --image G:\sim2real\so101-real-harness\samples\red\<随便一张>.jpg
+```bash
+python -m panel --collect
 ```
 
-标定期间的两个辅助开关：
+开窗就开始自动采集。
 
-- `python grasp_check.py --watch` —— 实时打印 6 号舵机角度。手动开合爪子，看空抓是不是接近 0°。
-- `python color_check.py --camera 0 --test-hue` —— 打印前景像素的色相直方图前 6 名，用来手工定区间。
+### 6.3 无人值守采集
 
-## 已知坑
+```bash
+python collect_real_dataset.py --episodes 10 --root datasets/so101_real_grasp_2cam_4hz --repo-id so101_real/pick_grasp_2cam
+```
 
-- **位置舵机在持续发「闭合」指令时会一直往闭合方向挤**，读回来的角度会缓慢变化。所以不要拿单次读数和固定阈值比，用 `GraspMonitor` 的「峰值基准 + 变化量」判据。
-- **单次 SCS 读会丢包**。所有读都走 `read_gripper_deg()` 的中位数滤波，别直接调 `get_servo_angle`。
-- **红色跨色相 0 点**，所以 `color_check` 和 `calibrate_color` 都做了「色相平移到 -90..89」的处理。标定红色时出来两段区间是正常的。
-- **光照色温会把色相整体推偏**。`channel_order_guess()` 不看色相、只看 B/G/R 哪个通道强，换灯不用重标。它和 HSV 结论不一致时，`_report` 会打印「这帧别信」。
-- **负载判据现在拿不到**。驱动只读了位置寄存器（L285）。想加「使多大劲」这个物理量，得自己补一个寄存器读 —— 但那是改 `mcp_robot` 的驱动，会影响真机 MCP server，先问用户。
-- 模块 B 的分母是**前景像素数**（够彩的像素），不是全图 —— 这样方块离得远近不影响占比。前景为 0 时返回全 0，不返回垃圾值。
+`--episodes 0` 表示不设上限；`--dry-run` 只跑不写盘；`--no-vlm-judge` 关闭合爪前的 Qwen 判官。
 
-## 下一步（按顺序）
+### 6.4 π0.5 末段
 
-1. 确认真机相机取帧走哪条路，改 `open_camera` 或固定用 `--image`。
-2. 拍一张「夹住方块举起来」的图，确认方块在腕机画面里。**这一步不通过，模块 B 就白做。**
-3. 跑 `calibrate_grasp.py` 2~3 遍，看阈值稳定性。
-4. 三个颜色各采 20 张，跑 `calibrate_color.py`。
-5. `--check` 和 `--image` 各验证一遍。
-6. 以上都过了，才是把它接进 harness 主循环（每轮：夹爪判有 → 颜色判色 → 抬起过程判掉没掉 → 写一行结果）。
+先启动外部策略服务并做本机端口转发，然后：
 
-## 不要做的事
+```bash
+python _pi05_run.py --steps 200 --hz 4
+```
 
-- **不要把阈值写死在代码里。** 唯一的阈值来源是 `thresholds.json`。
-- **不要用 `lerobot-annotate`。** 它走 VLM 做语言/VQA 标注，是黑盒，和本目录的路线相反。
-- **不要改 `G:\sim2real\mcp_robot\sources\servo_control_standalone.py`。** 那是真机 MCP server 正在用的驱动。
+只让 π0.5 驱动整段。要跑「脚本对轴 + π0.5 接管末段」的一趟：
 
-## 和 LeRobot 官方那套的关系
+```bash
+python _vla_end_try.py
+```
 
-LeRobot 0.6 自带 `lerobot-rollout`，有 `sentry` / `highlight` / `dagger` 等策略（源码在 `G:\anaconda\envs\sim2real\Lib\site-packages\lerobot\scripts\lerobot_rollout.py`），现成、能用。但它判成功走的是**学习式的 reward classifier**（ResNet-10 二分类，`configuration_classifier.py`，`num_classes: 2`），是黑盒。本目录是它之外的平行方案：判定用阈值，不用模型。
+`configs/strategies.json` 里的 `vla_end` 就是这条路的策略条目。
 
-两者不冲突 —— `lerobot-rollout` 负责「让策略跑、录数据」，本目录负责「判这一轮成没成、夹的是什么色」。要接的话，本目录的模块挂到 rollout 的每轮首尾即可。
+### 6.5 标定
+
+- 内参 + 手眼：`real/calib_views.py` 采视图，`real/mount_check.py` 用 ChArUco 验反投影。
+- 颜色 / 夹爪阈值：`calibrate_color.py`、`calibrate_grasp.py` 写 `thresholds.json`。
+- 工位常数：`configs/real.yaml` 的 `table_z_mm`、`pick_xy_mm`、`percep_offset_mm`，换桌面或换相机后要重量。
+
+## 7. 数据与训练
+
+### 7.1 数据集格式
+
+采集写 LeRobot v3.0（`lerobot 0.6.1`）：
+
+- `observation.state` / `action`：6 维，关节角（度，0~180 舵机口径），顺序 `shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper`。
+- `observation.images.camera1`：腕相机，960×540。
+- `observation.images.camera2`：侧相机（配置了侧相机时才有）。
+- `task`：每帧一句，来自 `configs/real.yaml` 里的目标颜色。
+- `fps=4`：0.2 s 的采样闸口隔一步录一帧。
+
+只录抓取那一段：夹爪标定段和摆件段不录；抓成（`held` 且没掉）的集才写盘。无人值守那轮 6 小时产出 120 条，有效率 68%。
+
+### 7.2 π0.5 LoRA
+
+- 切末段：`_build_endseg.py` 从 6 号舵机第一次读到 >15° 的前 2 帧切到集尾；262 集实测中位 28 帧/集。丢掉 ep 0~19，因为那 20 集张到 99~100°，和现役 20° 上限不是同一套。
+- 训练配置：`pi05=True`、`action_horizon=10`、`paligemma_variant=gemma_2b_lora`、`action_expert_variant=gemma_300m_lora`、20k steps、恒定 lr 1e-5、batch 2；只训 LoRA adapter。
+- 配置片段在 `_add_endseg_cfg.py`、`_add_v2_cfg.py`，启动脚本在 `_train_pi05_v2.sh`。这些脚本里的路径是云端环境专用，公开前按环境改。
+
+### 7.3 Qwen3-VL 判官
+
+- 数据：`_build_vlm_sft.py` 把成败样本做成成对图（合爪前 + 当前），标签来自 6 号舵机合爪角（`held` = 方块顶住，`empty` = 合到底）。
+- 规模：6 类失败场景，300 条成对样本训练；280 条评测样本上二分类准确率 92.9%。
+- 模型：Qwen3-VL-4B-Instruct + LoRA（rank 16、alpha 32）。
+- 部署：ms-swift 起 OpenAI 兼容端点，`ppo/vlm.py::judge` 通过 `VLM_JUDGE_BASE_URL` 接入。
+
+### 7.4 复现说明
+
+数据集、模型权重、训练日志都不在本仓库。`datasets/` 和 `out/` 由采集/训练脚本按环境生成；`configs/real.yaml` 里的数据集根目录、串口、相机序号是现场值。
+
+## 8. 演示媒体
+
+GitHub 不能内嵌播放 mp4，点封面图会打开 `docs/media/videos/` 下的原始视频。
+
+### 无人值守连续采集
+
+| | |
+|---|---|
+| [![15 秒](docs/media/thumbs/00-unattended-15s.jpg)](docs/media/videos/00-unattended-15s.mp4)<br>**15 秒原速**：完整一趟采集 | [![23 分钟 8 倍速](docs/media/thumbs/01-unattended-23min-8x.jpg)](docs/media/videos/01-unattended-23min-8x.mp4)<br>**23 分钟 8 倍速**：连续多趟不干预 |
+
+### 脚本三档
+
+| | |
+|---|---|
+| [![一步到位](docs/media/thumbs/02-script-oneshot.jpg)](docs/media/videos/02-script-oneshot.mp4)<br>**一步到位**：跳过合爪前微调 | [![先量一眼](docs/media/thumbs/03-script-measure-once.jpg)](docs/media/videos/03-script-measure-once.mp4)<br>**先量一眼**：量缝后微调 |
+| [![完整微调](docs/media/thumbs/04-script-full-finetune.jpg)](docs/media/videos/04-script-full-finetune.mp4)<br>**完整微调**：画面雅可比闭环 | [![微调 5 次](docs/media/thumbs/05-script-finetune-5x.jpg)](docs/media/videos/05-script-finetune-5x.mp4)<br>**微调 5 次**：连续纠偏 |
+
+### VLA 末段
+
+| | |
+|---|---|
+| [![腕子对齐后交给 π0.5](docs/media/thumbs/06-vla-handover.jpg)](docs/media/videos/06-vla-handover.mp4)<br>**腕子对齐后交给 π0.5**：脚本对轴，模型接管下探合爪 | [![模型先夹空再重夹](docs/media/thumbs/07-vla-retry.jpg)](docs/media/videos/07-vla-retry.mp4)<br>**先夹空再重夹**：失败后按判据重来 |
+
+## 9. 已知边界
+
+- 真机常数强依赖现场：串口、相机序号、桌面高度、感知偏移、初始舵机原始值分别在 `configs/real.yaml`、`real_home.py`、`assets/` 里，换一台机器要重新标定。
+- Qwen3-VL 判官只覆盖「合爪前方块在不在两爪之间」；合爪后的滑落不在它的判据里。
+- π0.5 的策略服务在外部 GPU，仓库只含客户端和末段接线，不能单独起模型。
+- 真机面板一次跑一趟默认只合一次爪（`max_attempts: 1`）；重试由无人值守采集的 `ppo/policy.py` 或面板的策略阶梯负责，不靠原样重放。
+- 数据集、权重、日志不随仓库发布。

@@ -1,4 +1,5 @@
-"""按那一层：**一个原生 Windows 窗口**（tkinter），左边画面、右边按钮和读数。
+"""按那一层：**一个原生 Windows 窗口**（tkinter），左边腕相机画面 + 右侧一列侧视画面，
+最右边是按钮和读数。
 
 **为什么从 cv2 换成 tkinter。** 原来那版是 `cv2.namedWindow` + 自己画按钮，两个硬伤：
 按钮是用 `cv2.rectangle` 摆出来的、`cv2.putText` **只认 ASCII**（中文画出来是一排 `?`，
@@ -44,6 +45,7 @@ UI_S = 0.08
 READOUT_S = 0.40
 LOG_KEEP = 300
 PIC_H = 620                       # 画面默认显示高度（等比缩放，原帧不裁）
+SIDE_W = 330                      # 侧视那一列的宽度（侧相机出的是 860×900 的竖幅）
 
 JOINTS_CN = ("1 肩转", "2 肩抬", "3 肘弯", "4 腕俯", "5 腕转", "6 夹爪")
 # 相位的说法只维护一张表：`measure.PHASES`（画面用英文那列，这里用中文那列）。
@@ -147,8 +149,13 @@ class Panel:
         self._last_frame_id = None
         self._pic_size = (0, 0)
         self._render_size = (0, 0)
+        self._side_size = (0, 0)
+        self._side_render_size = (0, 0)
+        self._side_placeholder = False
         self._sized = False                   # 头一帧到了才定窗口尺寸，见 `_show`
         self._photo: ImageTk.PhotoImage | None = None
+        self._side_photo: ImageTk.PhotoImage | None = None
+        self._last_side_key = None
         self._last_snap: dict = {}
         self._t_readout = 0.0
         # `rig` 的中文日志接到这块窗口上（原来只 print 到终端）。**在构造之后接**，
@@ -163,6 +170,12 @@ class Panel:
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
+        # **右边那一列先 pack**（2026-10-20）：pack 是按顺序分地方的，`left` 先 pack
+        # 就会把 `expand=True` 要到的宽度全占了，右边那一列被挤出窗口 —— 侧视那一列
+        # 加上去之后，按钮整块跑到屏幕外面去了。先右边、后左边，右边就永远拿得够。
+        right = tk.Frame(self.root, bg=BG, padx=8, pady=6)
+        right.pack(side="right", fill="y")
+
         left = tk.Frame(self.root, bg=BG)
         left.pack(side="left", fill="both", expand=True)
         # **画面这块必须是 Canvas，不能是 Label。** Label 的「想要多大」= 它当前那张图的
@@ -170,13 +183,36 @@ class Panel:
         # Label 就想要更大，布局给它更大，下一帧按更大的尺寸重算，图又更大。窗口最大化
         # 之后这个环就转起来了，看着就是「画面自己在变大」。Canvas 的大小是构造时定死的
         # （下面那两个 `width` / `height`），往里塞多大的图都不改它的诉求，环断了。
+        #
+        # **侧视挂在右边一列**（2026-10-20）：这块屏只有 1536×864 的逻辑尺寸，竖着
+        # 再切一条出来，腕相机那一路就只剩一半高。并排只占宽度，高度还是腕相机的。
+        self.side_col = tk.Frame(left, bg="#181a1d", width=SIDE_W)
+        self.side_col.pack(side="right", fill="y")
+        self.side_col.pack_propagate(False)      # 宽度就钉在 SIDE_W，不被子控件撑走
+        self.side_pic = tk.Canvas(self.side_col, bg="#181a1d",
+                                  highlightthickness=0, bd=0)
+        self.side_pic.pack(fill="both", expand=True)
+        self.side_pic.bind("<Configure>", self._on_side_resize)
+        # 这一行照**实际打开的那台相机**写（裁剪框和转角度都是配置给的），不写死。
+        side = getattr(self.rig, "side", None)
+        if side is not None:
+            crop = ",".join(str(v) for v in side.crop) if side.crop else "不裁"
+            sw, sh = side.size()
+            side_txt = (f"侧视 {sw}×{sh}（只录数据，不参与抓取）\n"
+                        f"裁 {crop} · 转 {side.rotate:g}°")
+        else:
+            side_txt = "侧视：没打开"
+        self.side_lbl = tk.Label(
+            self.side_col, text=side_txt,
+            bg="#181a1d", fg=DIM, font=FONT, anchor="w", justify="left",
+            wraplength=SIDE_W - 12)
+        self.side_lbl.pack(side="bottom", fill="x", padx=6, pady=4)
+
         self.pic = tk.Canvas(left, bg="#181a1d", highlightthickness=0, bd=0,
                              width=1100, height=self.pic_h)
-        self.pic.pack(fill="both", expand=True)
+        self.pic.pack(side="left", fill="both", expand=True)
         self.pic.bind("<Configure>", self._on_resize)
 
-        right = tk.Frame(self.root, bg=BG, padx=8, pady=6)
-        right.pack(side="right", fill="y")
         self._build_estop(right)
         self._build_target(right)
         self._build_skill(right)
@@ -251,22 +287,21 @@ class Panel:
                                  lambda: self.rig.submit(kind="pick_run"),
                                  width=26, fg="#ffffff", bg=ACC)
         self.run_btn.pack(fill="x", pady=1)
-        # **关节回放**（用户 2026-10-19）：把上一次抓成的那条轨迹原样走一遍；
-        # 抬升完没夹住会自己回初始位置、用正常逻辑重跑这一趟。
-        self.replay_btn = self._btn(box, "⟲ 回放上一趟",
-                                    lambda: self.rig.submit(kind="replay_run"),
-                                    width=26, fg="#d6e8ff", bg="#243a50")
-        self.replay_btn.pack(fill="x", pady=1)
-        # **换抓取方向**（用户 2026-10-19）：让腕子去对**另一对**侧面。只对两对跨度
-        # 相同的方块（近似正方）有意义；长方体仍按小跨度那一对，转了也不会变。
-        self.side_btn = self._btn(box, "抓另一侧：关 / F6", self._toggle_side,
-                                  width=26, fg="#e0d6ff", bg="#3a2f5a")
-        self.side_btn.pack(fill="x", pady=1)
         # **自动连跑**（用户 2026-10-18）：闸口全关，跑完回初始位置再接下一样。
         # 再按一下（或 F5）就关；「停手」「放弃」也会把它关掉。
         self.auto_btn = self._btn(box, "自动连跑：关 / F5", self._toggle_auto,
                                   width=26, fg="#ffe9b0", bg="#5a4a1f")
         self.auto_btn.pack(fill="x", pady=1)
+        # **自动采集数据**（2026-10-20 用户：自动采，但要有面板看着）。开着就是
+        # 自动连跑 + 每一趟录一集（腕相机 + 侧相机），抓成存盘、没抓成丢掉。
+        self.collect_btn = self._btn(box, "● 采集数据：关 / F6", self._toggle_collect,
+                                     width=26, fg="#cfe9ff", bg="#1f3a4a")
+        self.collect_btn.pack(fill="x", pady=1)
+        # **策略**（用户 2026-10-20）：一次不行换下一支。名字和参数在
+        # `configs/strategies.json`，这里只是按阶梯顺序转一下。
+        self.strat_btn = self._btn(box, "策略：— / F7", self._toggle_strategy,
+                                   width=26, fg="#e6d6ff", bg="#3a2f4a")
+        self.strat_btn.pack(fill="x", pady=1)
         # **从断点继续**（用户 2026-10-18）：停手 / 关掉自动之后，手动动过臂再按这个，
         # 从技能停下的那一段接着走。按哪个口由 `rig.resume_stage()` 定（对准 / 微调 /
         # 下探一截并合爪）；手里抓着东西时它给 None，按钮灰着。
@@ -406,13 +441,15 @@ class Panel:
         on = not bool((self._last_snap or {}).get("auto"))
         self.rig.submit(kind="auto", on=on)
 
-    def _toggle_side(self) -> None:
-        """翻「换抓取方向」开关。**状态以界面这一头为准** —— 只有这里改它。"""
-        on = not bool(getattr(self, "_side_on", False))
-        self._side_on = on
-        self.side_btn.configure(text=f"抓另一侧：{'开' if on else '关'} / F6",
-                                bg=("#4a3a7a" if on else "#3a2f5a"))
-        self.rig.submit(kind="grasp_side", deg=(90.0 if on else 0.0))
+    def _toggle_collect(self) -> None:
+        """翻「采集」开关。状态以 `rig` 那一头为准（停手 / 连续失败会自己关）。"""
+        on = not bool((self._last_snap or {}).get("collect"))
+        self.rig.submit(kind="collect", on=on)
+
+    def _toggle_strategy(self) -> None:
+        """换下一支策略。**不给名字** —— 顺序由 `configs/strategies.json` 的阶梯定，
+        真正的套用在下一趟开跑之前（硬件线程里做）。"""
+        self.rig.submit(kind="strategy")
 
     def _resume(self) -> None:
         """从断点继续。**入口由 `rig.resume_stage()` 定**，这里只把命令递进去：
@@ -446,8 +483,9 @@ class Panel:
     def _bind_keys(self) -> None:
         r = self.root
         r.bind("<F1>", lambda e: self.rig.submit(kind="pick_run"))
-        r.bind("<F6>", lambda e: self._toggle_side())
         r.bind("<F5>", lambda e: self._toggle_auto())
+        r.bind("<F6>", lambda e: self._toggle_collect())
+        r.bind("<F7>", lambda e: self._toggle_strategy())
         r.bind("<space>", lambda e: self._gate("go"))
         r.bind("<F2>", lambda e: self._gate("relook"))
         r.bind("<F3>", lambda e: self._gate("descend"))
@@ -474,6 +512,9 @@ class Panel:
     def _on_resize(self, ev) -> None:
         self._pic_size = (max(1, ev.width), max(1, ev.height))
 
+    def _on_side_resize(self, ev) -> None:
+        self._side_size = (max(1, ev.width), max(1, ev.height))
+
     def _loop(self) -> None:
         if not self.running:
             return
@@ -490,6 +531,21 @@ class Panel:
                 self._show(bgr, snap)
             elif bgr is not None and self._pic_size != self._render_size:
                 self._show(bgr, snap)          # 窗口被拉过，按新尺寸重画
+            # **侧视那一列**：换帧了才重画；窗口被拉过也重画。没帧就写一句话，
+            # 不留一块黑底让人以为是相机坏了还是面板没接上。
+            side = snap.get("side_bgr")
+            if side is not None:
+                self._side_placeholder = False
+                skey = snap.get("side_t")
+                if skey != self._last_side_key or self._side_size != self._side_render_size:
+                    self._last_side_key = skey
+                    self._show_side(side)
+            elif not self._side_placeholder:
+                self._side_placeholder = True
+                self.side_pic.delete("all")
+                w, h = self._side_size if self._side_size[0] > 2 else (SIDE_W, 360)
+                self.side_pic.create_text(w // 2, h // 2, fill=DIM, font=FONT,
+                                          text="侧相机没打开\n（看终端装配那几行）")
             _t = time.perf_counter()
             self._gates(snap)
             # **读数那块按自己的节拍照抄，不跟画面同频**（2026-10-18 时延）：它一次
@@ -523,7 +579,12 @@ class Panel:
             self._sized = True
             bh = min(980, max(360, self.pic_h))
             bw = int(pil.width * bh / max(1, pil.height))
-            self.root.geometry(f"{min(1900, bw + 470)}x{bh + 90}")
+            # **按这块屏的可用尺寸收**（2026-10-20）：这块屏是 1536×864 的逻辑尺寸，
+            # 原来那 1900 的宽上限在它上面直接把窗口顶出屏幕右边，右边按钮点不着。
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            self.root.geometry(f"{min(sw - 40, bw + 380 + SIDE_W)}x"
+                               f"{min(sh - 80, bh + 90)}")
         k = min(w / pil.width, h / pil.height)
         size = (max(1, int(pil.width * k)), max(1, int(pil.height * k)))
         _t2 = time.perf_counter()
@@ -536,6 +597,21 @@ class Panel:
         self._render_size = self._pic_size
         _prof_add("缩放", _t3 - _t2)
         _prof_add("上屏", time.perf_counter() - _t3)
+
+    def _show_side(self, bgr) -> None:
+        """侧视那一帧 → 上去。**不标任何东西** —— 这一路没有标定，画上去的框没人能用。"""
+        w, h = self._side_size if self._side_size[0] > 2 else (SIDE_W, 360)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        k = min(w / pil.width, h / pil.height)
+        size = (max(1, int(pil.width * k)), max(1, int(pil.height * k)))
+        if size != pil.size:
+            pil = pil.resize(size, Image.BILINEAR)
+        self._side_photo = ImageTk.PhotoImage(pil)   # 必须留引用，否则被回收成白框
+        self.side_pic.delete("all")
+        self.side_pic.create_image(w // 2, h // 2, image=self._side_photo,
+                                   anchor="center")
+        self._side_render_size = self._side_size
         _prof_flush()
 
     def _gates(self, snap: dict) -> None:
@@ -555,6 +631,18 @@ class Panel:
             self.auto_btn.configure(text=f"自动连跑：开（第 {n} 轮）/ F5", bg=OKC)
         else:
             self.auto_btn.configure(text="自动连跑：关 / F5", bg="#5a4a1f")
+        # **采集那一行自己报进度**：成功 / 失败 / 已经连续几趟没成。
+        collect = bool(snap.get("collect"))
+        if collect:
+            self.collect_btn.configure(
+                text=f"● 采集中：成功 {int(snap.get('n_ok') or 0)} / "
+                     f"失败 {int(snap.get('n_bad') or 0)}   F6 停",
+                bg="#1f6b4a")
+        else:
+            self.collect_btn.configure(text="● 采集数据：关 / F6", bg="#1f3a4a")
+        # **策略那一行**：显示下一趟会用的那一支（已经在跑的这趟不变）。
+        lab = str(snap.get("strategy_label") or snap.get("strategy") or "")
+        self.strat_btn.configure(text=f"策略：{lab or '—'} / F7")
         # **当前段**（`state.seg` 的原文）：停手之后按这个决定从哪儿接。
         seg = str(snap.get("stage") or "")
         seg_txt = f"\n当前段：{seg}" if seg else ""
@@ -563,9 +651,10 @@ class Panel:
                 text=f"⏸ 停在断点：{gate['kind']}\n{gate.get('note') or ''}{seg_txt}",
                 fg="#ffd479")
         elif busy:
-            self.gate_lbl.configure(
-                text=("自动模式：这一轮在跑，不停" if auto
-                      else "技能在跑……（到断点会自己停）") + seg_txt, fg=DIM)
+            running = ("采集中：这一趟在跑" if collect
+                       else "自动模式：这一轮在跑，不停") if auto \
+                else "技能在跑……（到断点会自己停）"
+            self.gate_lbl.configure(text=running + seg_txt, fg=DIM)
         else:
             self.gate_lbl.configure(
                 text=("自动模式：等下一轮开跑" if auto else "没在跑") + seg_txt, fg=DIM)

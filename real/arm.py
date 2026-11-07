@@ -54,15 +54,12 @@ from so101_nexus.lerobot_adapter.normalization import (           # noqa: E402
 from core.geom import align_action                                 # noqa: E402
 from core.interfaces import Arm                                   # noqa: E402
 from core.registry import register                                # noqa: E402
-from servo_bridge import SERVO_TO_JOINT, open_controller          # noqa: E402
+from servo_bridge import (GRIPPER_ID, GRIPPER_MAX_OPEN_DEG,      # noqa: E402
+                          SERVO_TO_JOINT, open_controller)
 
 MJCF = Path(r"G:\sim2real\SO-ARM100\Simulation\SO101\so101_new_calib.xml")
 CAL_JSON = _ROOT / "assets" / "lerobot_calibration" / "little_little_pig.json"
 TCP_SITE = "gripperframe"
-
-# 关节回放的录制钩子：`real/joint_rec.py` 的 Recorder.feed 挂在这里。None = 不录。
-# 每次 `write_ticks` 下发什么就收什么 —— 记的是指令，不是读数，不额外占串口。
-WRITE_HOOK = None
 
 # ---- 对外报的 TCP 口径：照仿真那一套 ----
 # 仿真跑的不是上面这个文件，是 nexus 的 menagerie 模型。`gripper` body 在两边逐字节
@@ -101,6 +98,12 @@ TIP_FIXED_BODY = "gripper"
 TIP_MOVING_BODY = "moving_jaw_so101_v1"
 TIP_FIXED = np.array([-0.0089, -0.0002, -0.1044])
 TIP_MOVING = np.array([-0.0087, -0.0820, 0.0189])
+
+#: **夹爪张开上限（qpos 度）。2026-10-21 用户定：任何时候张开都不许超过 20°。**
+#: 这是硬上限，不是「建议值」：`RealArm.write_ticks` 会把 6 号的刻数夹到
+#: `grip_open_tick`，所有绕过 `write_ticks` 的开爪（`measure_open`）也必须用它。
+#: `grip_hi`（MJCF 行程上限 100.0°）只留给读数换算和夹取范围的钳位。
+GRIP_OPEN_DEG = float(GRIPPER_MAX_OPEN_DEG)
 
 # 动作单位 → 物理量。**这三个数不自己定，跟 nexus 的 `EE_DELTA_ACTION_SCALE` 取齐**：
 # 位置 0.02 米/单位（= core.params.POS_SCALE）、姿态 0.1 弧度/单位、夹爪 0.2 弧度/单位。
@@ -215,6 +218,18 @@ class RealArm(Arm):
                      else open_controller(port, fast=self.fast))
         # 读缓存。True = 手上的读数不作数，下一次读得真去总线问。见 `read_ticks`。
         self._dirty = True
+        # **必须在下面那次 `grip_q()` 之前建好**（2026-10-21）：`grip_q` → `read_ticks`，
+        # 某个舵机第一次就读不到时会走 `self.last_ticks.get(sid)` 这个兜底分支。原来这一行
+        # 写在 `_grip_cmd` 后面，于是兜底分支自己抛 `AttributeError: ... no attribute
+        # 'last_ticks'`，把真正的原因（某个舵机读不到）盖掉了。
+        self.last_ticks: dict[int, int] = {}
+
+        # **20° 上限对应的刻数**（按这份标定算一次，`write_ticks` 拿它当硬夹）。
+        # 2026-10-21 用户定：任何时候张开都不许超过 20°，所以这一层必须拦在写之前。
+        _q_open = np.zeros(6, dtype=np.float64)
+        _q_open[5] = self.grip_open
+        self._grip_open_tick = int(self._qpos_to_ticks(_q_open)[GRIPPER_ID])
+        self._cap_hits = 0          # 6 号被夹回上限的次数（只在第一次打日志）
 
         # 和 SimArm 一样的两个速度状态
         self.vel = np.zeros(3, dtype=np.float64)
@@ -223,7 +238,6 @@ class RealArm(Arm):
         # 「当前命令要去到的角」。起点按真机此刻的读数，不是 0。
         self._grip_cmd = float(self.grip_q())
         self.terminated = False
-        self.last_ticks: dict[int, int] = {}
         self.n_steps = 0
         # 逆解里姿态误差的权重。默认就是模块级 `OW`（和 `arm_sim.py` 同一档）。
         # **进场那一段要临时调小**，见 `skills/pick_real.py` 的 `REAL_IK_OW`。
@@ -265,15 +279,27 @@ class RealArm(Arm):
             return out
 
     def write_ticks(self, ticks: dict[int, int]) -> None:
-        payload = {int(k): int(v) for k, v in ticks.items()}
+        """写六个舵机的目标刻数。**6 号在这里硬夹到 20° 上限**（`grip_open_tick`）。
+
+        2026-10-21 用户定「不管什么时候张开爪子，都不能大于 20°」。技能、轨迹、
+        `follow`、面板全走这一条，所以夹在这里就是全局的；真被夹了会打一行字，
+        不去悄悄改掉——看见这行说明上面有地方写了超限的张开目标。
+        """
+        ticks = {int(k): int(v) for k, v in ticks.items()}
+        t6 = ticks.get(GRIPPER_ID)
+        if t6 is not None and t6 > self._grip_open_tick:
+            # **只报第一次。** 回初始位置那条轨迹里 6 号是一帧一帧往 1972 刻爬的，
+            # 每帧都要夹一次；2026-10-21 实测刷了 15 行一样的字，看不出别的东西。
+            self._cap_hits += 1
+            if self._cap_hits == 1:
+                print(f"！6 号张开超过 {GRIP_OPEN_DEG:.0f}° 上限：{t6} 刻 → 夹到 "
+                      f"{self._grip_open_tick} 刻（这一趟后面再超限不再重复报）",
+                      flush=True)
+            ticks[GRIPPER_ID] = self._grip_open_tick
         with _BUS:
-            self.ctrl.sync_set_positions(payload, speed=self.speed)
+            self.ctrl.sync_set_positions(ticks, speed=self.speed)
             # 写了就作废缓存：下一次读得真去总线问，才看得见这一步有没有动。
             self._dirty = True
-        # 关节回放的录制钩子（`real/joint_rec.py`）。None = 不录，零开销。
-        hook = WRITE_HOOK
-        if hook is not None:
-            hook(payload)
 
     def _ticks_to_qpos(self, ticks: dict[int, int]) -> np.ndarray:
         by_name = {SERVO_TO_JOINT[sid]: int(v) for sid, v in ticks.items()}
@@ -330,6 +356,11 @@ class RealArm(Arm):
         分量还是 −0.994（`ow=0.05` 时是 −0.990）—— **爪子照样是竖直的**。
         姿态不是不管，是交给 `drive` 一步步转过去，别让它在逆解里跟位置平起平坐。
         """
+        # **解的时候就带上安全下限**（2026-10-25 用户：「直接带上限制」）：2 号肩抬
+        # −45°、3 号肘两臂夹角 ≥75°。先解到硬件行程上再让闸判，结果是解得出、但一出
+        # 手就撞闸停手；带着限制解，逆解会在允许范围里换一组关节分配。
+        from real import safety                                      # noqa: PLC0415
+        lo, hi = safety.clip_bounds(self.q_lo, self.q_hi)
         q = np.array(qpos0, dtype=np.float64, copy=True)
         for _ in range(int(iters)):
             pos, quat = self._fk(q)
@@ -338,7 +369,7 @@ class RealArm(Arm):
                                np.asarray(target_quat, dtype=np.float64),
                                orientation_weight=(self.ow if ow is None else float(ow)),
                                damping=EE_IK_DAMPING)
-            q = np.clip(q + dq, self.q_lo, self.q_hi)
+            q = np.clip(q + dq, lo, hi)
         return q
 
     # ---- Arm 接口 ----
@@ -498,6 +529,21 @@ class RealArm(Arm):
     def grip_q(self) -> float:
         """夹爪关节现在的角度（弧度）。合爪 = 把它压小。"""
         return float(self._ticks_to_qpos(self.read_ticks())[5])
+
+    @property
+    def grip_open(self) -> float:
+        """**张开指令角（弧度）。** 所有「张爪」写这个，不写 `grip_hi`。
+
+        用户 2026-10-21 定：**任何时候张开都不许超过 20°**（`GRIP_OPEN_DEG`）。
+        `grip_hi` 是 MJCF 的行程上限（100°），写下去只会让 6 号顶在止位上。
+        仍然夹到 `[grip_lo, grip_hi]` 里，防止配置改小。
+        """
+        return float(np.clip(np.radians(GRIP_OPEN_DEG), self.grip_lo, self.grip_hi))
+
+    @property
+    def grip_open_tick(self) -> int:
+        """20° 上限对应的 6 号刻数。**绕过 `write_ticks` 的开爪必须用它当目标。**"""
+        return int(self._grip_open_tick)
 
     def contacts(self) -> int:
         """真机上没有接触传感器，按接口约定返回 0。**不是「没碰到」的意思。**"""

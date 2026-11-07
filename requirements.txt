@@ -1,0 +1,23 @@
+# 真机 harness 依赖（Python 3.12，Windows）
+numpy
+opencv-python
+scipy
+toppra
+mujoco
+PyYAML
+Pillow
+pyserial
+
+# LeRobot 数据集读写（采集直接写 v3.0 格式）
+lerobot==0.6.1
+pandas
+av
+
+# π0.5 客户端（openpi 仓库里的 openpi_client，不单独发 PyPI）
+# websockets 是 openpi_client 的传输依赖
+websockets
+
+# 可选：版本管理 / 调试
+# paramiko          # SSH 端口转发脚本
+# stable-baselines3 # 只在 ppo/ 的重试账本里可选
+# torch transformers ms-swift  # 只在 Qwen3-VL 判官训练/部署时用

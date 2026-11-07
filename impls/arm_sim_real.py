@@ -45,7 +45,7 @@ from so101_nexus.lerobot_adapter.normalization import (                # noqa: E
 
 from core.registry import register                                     # noqa: E402
 from impls.arm_sim import SimArm                                       # noqa: E402
-from real.arm import (CAL_JSON, OW, SERVO_TO_JOINT_REV,                # noqa: E402
+from real.arm import (CAL_JSON, GRIP_OPEN_DEG, OW, SERVO_TO_JOINT_REV,  # noqa: E402
                       load_calibration)
 from servo_bridge import SERVO_TO_JOINT                                # noqa: E402
 
@@ -151,6 +151,12 @@ class SimRealArm(SimArm):
         self.ow = OW
 
         self.cal = load_calibration(CAL_JSON)
+        # **20° 张开上限对应的刻数**（和 `RealArm.grip_open_tick` 同名同口径）。
+        # 2026-10-21 用户定：不管什么时候张开都不许超过 20°，仿真这一支跟着真机走。
+        _q_open = np.zeros(6, dtype=np.float64)
+        _q_open[5] = float(np.clip(np.radians(GRIP_OPEN_DEG),
+                                   self.grip_lo, self.grip_hi))
+        self._grip_open_tick = int(self._qpos_to_ticks(_q_open)[GRIPPER_ID])
         # 缓存口径跟 `RealArm.read_ticks` 一样：写下去就作废。区别是仿真里写完那一步
         # 就已经走到位了（`_write_ctrl` 当场推进物理），所以读是白拿的。
         self._dirty = True
@@ -191,7 +197,13 @@ class SimRealArm(SimArm):
 
         真机那边是写六个舵机的目标位置、舵机自己转过去。仿真这边模型的六个
         `<position>` 执行器就是那六个伺服，写 `data.ctrl` 再推进物理是同一件事。
+
+        **6 号在这里硬夹到 20° 上限**（跟 `RealArm.write_ticks` 同一条规矩）。
         """
+        ticks = {int(k): int(v) for k, v in ticks.items()}
+        t6 = ticks.get(GRIPPER_ID)
+        if t6 is not None and t6 > self._grip_open_tick:
+            ticks[GRIPPER_ID] = self._grip_open_tick
         self._write_ctrl(self._ticks_to_qpos(ticks))
         self._dirty = True
         self.n_steps += 1
@@ -226,6 +238,17 @@ class SimRealArm(SimArm):
         """此刻的 6 号舵机角（度）。**读的是关节实际位置**，不是发出去的指令 ——
         夹着东西合不拢时这里就是一个比 `empty_deg` 大的数，判据全靠这个差。"""
         return _tick_to_deg(self._qpos_to_ticks(self._qpos_now())[GRIPPER_ID])
+
+    @property
+    def grip_open(self) -> float:
+        """张开指令角（弧度）。和 `RealArm.grip_open` 同一个上限：20°。"""
+        return float(np.clip(np.radians(GRIP_OPEN_DEG),
+                             self.grip_lo, self.grip_hi))
+
+    @property
+    def grip_open_tick(self) -> int:
+        """20° 上限对应的 6 号刻数（`measure_open` 要它）。"""
+        return int(self._grip_open_tick)
 
     def goto_grip_deg(self, deg: float, max_steps: int = GRIP_SETTLE_STEPS,
                       tol: float = GRIP_SETTLE_TOL) -> float:
@@ -299,6 +322,9 @@ class SimRealArm(SimArm):
         不另立解释，免得两边说法打架。**唯一的差别是解的模型**：那边解官方 MJCF，
         这边直接解 nexus 的模型（本来就跑在它上面）。
         """
+        # 夹取上下限和 `real/arm.py` 同一条：硬件行程再叠安全下限（2026-10-25）。
+        from real import safety                                      # noqa: PLC0415
+        lo, hi = safety.clip_bounds(self.q_lo, self.q_hi)
         q = np.array(qpos0, dtype=np.float64, copy=True)
         for _ in range(int(iters)):
             pos, quat = self._fk(q)
@@ -307,7 +333,7 @@ class SimRealArm(SimArm):
                                np.asarray(target_quat, dtype=np.float64),
                                orientation_weight=(self.ow if ow is None else float(ow)),
                                damping=EE_IK_DAMPING)
-            q = np.clip(q + dq, self.q_lo, self.q_hi)
+            q = np.clip(q + dq, lo, hi)
         return q
 
     # ---- 夹爪的两样：`pick_real` 的落点算式要的 ----

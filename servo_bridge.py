@@ -47,8 +47,15 @@ GRIPPER_ID = 6
 #   0°   = 合到底，爪面间距约 30.9 mm
 #   180° = 全开，  爪面间距约 55.9 mm
 # 方向如果和真机对不上，第一次用之前先确认一遍。
+#
+# **`GRIPPER_OPEN_DEG = 180` 已经删掉。** 2026-10-21 用户定：任何时候张开爪子都不许
+# 超过 20°（qpos 口径）。180° 换算成原始位置是 3072，比标定上限 2944 还远 —— 原来
+# `open_gripper` 就是拿它开的，这是全项目唯一一处绕过 `RealArm.grip_open` 的开爪。
+# 现在开爪必须显式给 `tick`（`RealArm.grip_open_tick`），没有默认值。
 GRIPPER_CLOSED_DEG = 0.0
-GRIPPER_OPEN_DEG = 180.0
+#: **张开上限（qpos 度）。2026-10-21 用户定：不管什么时候都不能超过这个数。**
+#: 真机（`RealArm`）和仿真（`SimRealArm`）都从这一条取，别再在别处写死角度。
+GRIPPER_MAX_OPEN_DEG = 20.0
 
 DEFAULT_PORT = "COM12"
 DEFAULT_BAUD = 1_000_000
@@ -125,9 +132,20 @@ def close_gripper(controller, speed: int = 0) -> bool:
     return controller.set_servo_angle(GRIPPER_ID, GRIPPER_CLOSED_DEG, speed)
 
 
-def open_gripper(controller, speed: int = 0) -> bool:
-    """开爪。"""
-    return controller.set_servo_angle(GRIPPER_ID, GRIPPER_OPEN_DEG, speed)
+def open_gripper(controller, speed: int = 0, tick: int | None = None) -> bool:
+    """开爪。**`tick` 必给**，它是 20° 上限对应的刻数（`RealArm.grip_open_tick`）。
+
+    原来这里写死 `GRIPPER_OPEN_DEG = 180`（= 3072 刻），比标定上限 2944 还远；
+    用户 2026-10-21 定死「不管什么时候张开爪子都不能大于 20°」，所以这条路不再有
+    默认值 —— 没给 `tick` 就直接报错，免得又悄悄开到最大。
+
+    刻数按驱动那条线性式换成舵机角再写（`set_servo_angle` 就在本文件引用的驱动里），
+    仿真那一支的 `_SimGripperCtrl.set_servo_angle` 收的也是这个角度，两边同一条路。
+    """
+    if tick is None:
+        raise ValueError("open_gripper 必须给 tick（用 RealArm.grip_open_tick）")
+    deg = (int(tick) - 1024) * 180.0 / 2048.0
+    return controller.set_servo_angle(GRIPPER_ID, deg, speed)
 
 
 # ---- 读任意寄存器（驱动缺的那一块，按本文件开头说的「缺的在这里补」）----

@@ -9,10 +9,9 @@ from core.params import (ALIGN_CHUNK, ALIGN_MAX_STEPS,            # noqa: E402
                          SLOW, SPEED, STUCK_TOL,
                          acc_amax, speed_vmax)
 import numpy as np
-from .knobs import PLACE_AWAY_M, PLACE_DEG_WIN, PLACE_OPEN_STEPS, PLACE_RAISE_M, PLACE_R_MAX_M, PLACE_R_MIN_M, PLACE_SAMPLE_MAX, PLACE_Z_TOL_MM, WRIST_TWIST_DEG
+from .knobs import PLACE_AWAY_M, PLACE_DEG_LEFT, PLACE_DEG_RIGHT, PLACE_OPEN_STEPS, PLACE_RAISE_M, PLACE_R_MAX_M, PLACE_R_MIN_M, PLACE_SAMPLE_MAX, PLACE_Z_TOL_MM, WRIST_TWIST_DEG
 from .rulers import _box_half_m
 from .motion import _goto, _wrist_turn
-from . import randlock
 def _place_xy_real(center) -> tuple[np.ndarray, str]:
     """抽一个落点 `(x, y)`（米，基座系）。返回 `(xy, 一句话说明)`。
 
@@ -24,13 +23,6 @@ def _place_xy_real(center) -> tuple[np.ndarray, str]:
     import random                                               # noqa: PLC0415
     import time                                                 # noqa: PLC0415
 
-    # **第一次抽到的落点记下来，之后每趟都用它**（用户 2026-10-19）。关节回放要求
-    # 下一轮开始时方块和上一轮一模一样，落点每趟重抽就永远对不上。
-    frozen = randlock.get("place_xy")
-    if frozen is not None:
-        xy = np.asarray(frozen, dtype=np.float64).reshape(-1)[:2]
-        return xy, "沿用记录下来的随机落点（第一次抓成那趟抽的）"
-
     base = np.asarray(geom.MARKER_CENTER, dtype=np.float64)
     pick = np.asarray(geom.real_pick_xy(), dtype=np.float64).reshape(-1)[:2]
     base_deg = float(np.degrees(np.arctan2(pick[1] - base[1], pick[0] - base[0])))
@@ -38,7 +30,7 @@ def _place_xy_real(center) -> tuple[np.ndarray, str]:
     rng = random.Random(seed)
     now = np.asarray(center, dtype=np.float64).reshape(-1)[:2]
     for _ in range(PLACE_SAMPLE_MAX):
-        deg = base_deg + rng.uniform(-PLACE_DEG_WIN, PLACE_DEG_WIN)
+        deg = base_deg + rng.uniform(-PLACE_DEG_RIGHT, PLACE_DEG_LEFT)
         r = rng.uniform(PLACE_R_MIN_M, PLACE_R_MAX_M)
         xy = np.array([base[0] + r * np.cos(np.radians(deg)),
                        base[1] + r * np.sin(np.radians(deg))], dtype=np.float64)
@@ -46,11 +38,10 @@ def _place_xy_real(center) -> tuple[np.ndarray, str]:
             continue
         if float(np.hypot(xy[0] - now[0], xy[1] - now[1])) < PLACE_AWAY_M:
             continue
-        randlock.put("place_xy", [float(xy[0]), float(xy[1])])
-        return xy, (f"方位 {deg:+.0f}°（工位 {base_deg:+.0f}° ±{PLACE_DEG_WIN:.0f}）、"
+        return xy, (f"方位 {deg:+.0f}°（工位 {base_deg:+.0f}° 左 {PLACE_DEG_LEFT:.0f}°"
+                    f"~右 {PLACE_DEG_RIGHT:.0f}°）、"
                     f"半径 {r * 1000:.0f}mm（{PLACE_R_MIN_M * 1000:.0f}~"
-                    f"{PLACE_R_MAX_M * 1000:.0f}），种子 {seed}"
-                    f" —— 已记下，后面每趟都用它")
+                    f"{PLACE_R_MAX_M * 1000:.0f}），种子 {seed}")
 
     # **抽不到就换一个，不是这一趟不放**（用户 2026-10-18：「如果放方块的位置结算不出来
     # 就换一个位置啊」）。随机抽空只说明这三个条件叠起来那个角太窄 —— round 2 实测命中率
@@ -60,7 +51,7 @@ def _place_xy_real(center) -> tuple[np.ndarray, str]:
     near_xy, near_d, near_tag = None, float("inf"), ""
     far_xy, far_d, far_tag = None, -1.0, ""
     for i in range(41):
-        deg = base_deg - PLACE_DEG_WIN + 2.0 * PLACE_DEG_WIN * i / 40.0
+        deg = base_deg - PLACE_DEG_RIGHT + (PLACE_DEG_LEFT + PLACE_DEG_RIGHT) * i / 40.0
         for j in range(29):
             r = PLACE_R_MIN_M + (PLACE_R_MAX_M - PLACE_R_MIN_M) * j / 28.0
             xy = np.array([base[0] + r * np.cos(np.radians(deg)),
@@ -75,17 +66,15 @@ def _place_xy_real(center) -> tuple[np.ndarray, str]:
                 near_xy, near_d, near_tag = xy, d, tag
     if far_xy is None:
         raise RuntimeError(f"这一圈里没有一个够得着的落点（工位 {base_deg:+.0f}° "
-                           f"±{PLACE_DEG_WIN:.0f}°、半径 "
+                           f"左 {PLACE_DEG_LEFT:.0f}°~右 {PLACE_DEG_RIGHT:.0f}°、半径 "
                            f"{PLACE_R_MIN_M * 1000:.0f}~{PLACE_R_MAX_M * 1000:.0f}mm）"
                            f" —— 这一趟不放，方块还在爪里")
     if near_xy is not None:
-        randlock.put("place_xy", [float(near_xy[0]), float(near_xy[1])])
         return near_xy, (f"{near_tag}（随机 {PLACE_SAMPLE_MAX} 次抽空，网格兜底取最近）；"
-                         f"离原处 {near_d * 1000:.0f}mm —— 已记下，后面每趟都用它")
-    randlock.put("place_xy", [float(far_xy[0]), float(far_xy[1])])
+                         f"离原处 {near_d * 1000:.0f}mm")
     return far_xy, (f"{far_tag}（随机 {PLACE_SAMPLE_MAX} 次抽空，网格兜底）；"
                     f"离原处 {far_d * 1000:.0f}mm，比 {PLACE_AWAY_M * 1000:.0f}mm 的"
-                    f"「离原处」还近 —— 这一圈里就它最远；已记下，后面每趟都用它")
+                    f"「离原处」还近 —— 这一圈里就它最远")
 
 def _open_gently(arm, max_steps: int = PLACE_OPEN_STEPS):
     """一小步一小步张爪，张到不动了为止。返回 `(停因, 事实)`。
@@ -101,7 +90,9 @@ def _open_gently(arm, max_steps: int = PLACE_OPEN_STEPS):
 
     ticks0 = {int(k): int(v) for k, v in arm.read_ticks().items()}
     q0 = float(arm.grip_q())
-    arm._grip_cmd = float(np.clip(q0, arm.grip_lo, arm.grip_hi))
+    # **张到 `grip_open` 就停**（2026-10-21 用户定：任何时候张开都不许超过 20°）。
+    q_hi = float(getattr(arm, "grip_open", arm.grip_hi))
+    arm._grip_cmd = float(np.clip(q0, arm.grip_lo, q_hi))
     q_prev = None
     stuck = 0
     for step in range(1, int(max_steps) + 1):
@@ -111,7 +102,7 @@ def _open_gently(arm, max_steps: int = PLACE_OPEN_STEPS):
         if stuck > STUCK_TOL:
             return "stall", {"steps": step, "q0": q0, "q": q, "why": "张到头了"}
         arm._grip_cmd = float(np.clip(arm._grip_cmd + GENTLE * _ARM_GRIP_SCALE,
-                                      arm.grip_lo, arm.grip_hi))
+                                      arm.grip_lo, q_hi))
         _qc = arm._ticks_to_qpos(ticks0)
         _qc[5] = arm._grip_cmd
         _write = dict(ticks0)
@@ -176,12 +167,8 @@ def _place_real(arm, percep, center, *, grasp_z, state) -> dict:
     import random                                               # noqa: PLC0415
 
     state.seg = "摆件：随机转腕"
-    want = randlock.get("wrist_deg")
-    if want is None:
-        want = random.uniform(-WRIST_TWIST_DEG, WRIST_TWIST_DEG)
-        randlock.put("wrist_deg", float(want))
-        print(f"      转腕：抽到 {want:+.1f}° —— 已记下，后面每趟都用它")
-    got = _wrist_turn(arm, float(want))
+    want = random.uniform(-WRIST_TWIST_DEG, WRIST_TWIST_DEG)
+    got = _wrist_turn(arm, want)
     print(f"      转腕：要 {want:+.1f}°，实际 {got:+.1f}°（5 号腕转；在落点上方、落下去之前）")
 
     state.seg = "摆件：落下去"
@@ -202,24 +189,6 @@ def _place_real(arm, percep, center, *, grasp_z, state) -> dict:
               f"**不松爪**，方块还在爪里，这一趟没摆成")
         return {"ok": False, "why": f"没落到位（最低点离桌面 {clear * 1000:.1f}mm）",
                 "at": [float(xy[0]), float(xy[1])]}
-
-    # **记下「方块是从哪儿、以什么姿势放下的」**（用户 2026-10-19）：下一轮方块就
-    # 躺在这一点。松爪这一刻的两爪中点就是方块中心（水平），TCP 与它的相对位置就是
-    # 抓它时要摆回去的位置；朝向、合爪高度、半边长一起记，下一轮照这条记录去抓，
-    # 不用重新看一眼。方块是垂直落下去的，水平位置不跟着变。
-    try:
-        from real import joint_rec as _jrec                        # noqa: PLC0415
-        _gap = np.asarray(arm.jaw_gap_center(), dtype=np.float64).reshape(-1)
-        _jrec.mark("place_low", tcp=[float(v) for v in tcp2],
-                   gap_center=[float(_gap[0]), float(_gap[1])],
-                   quat=[float(v) for v in np.asarray(arm.quat()).reshape(-1)],
-                   tool_x=[float(v) for v in
-                           np.asarray(arm.tool_x(), dtype=np.float64).reshape(-1)[:3]],
-                   half=float(half), grasp_z=float(grasp_z),
-                   pick_center_z=float(c0[2]), table_z=float(table),
-                   wrist_deg=float(got))
-    except Exception:                                             # noqa: BLE001
-        pass
 
     state.seg = "摆件：松爪"
     stop, info = _open_gently(arm)

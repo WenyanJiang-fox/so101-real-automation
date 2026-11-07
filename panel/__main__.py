@@ -31,6 +31,8 @@ def main(argv=None) -> int:
     ap.add_argument("--pic-h", type=int, default=620, help="画面那半边的初始高度（像素）")
     ap.add_argument("--run", action="store_true",
                     help="开窗就自己跑一趟（等于按 F1）。跑起来之后断点上照样停着等人点头")
+    ap.add_argument("--collect", action="store_true",
+                    help="开窗就开始自动采集（等于按 F6）：闸口全关、抓成存盘、没抓成丢掉")
     a = ap.parse_args(argv)
 
     # **控制台是 GBK 的时候，任何一个非 GBK 字符都会抛 `UnicodeEncodeError`，
@@ -62,6 +64,9 @@ def main(argv=None) -> int:
         # 没关系，所以窗口还没画出来就能塞（rig 那条线程自己在泵队列）。
         print("    `--run`：窗口一开就跑一趟。", flush=True)
         rig.submit(kind="pick_run")
+    if a.collect:
+        print("    `--collect`：窗口一开就开始自动采集。", flush=True)
+        rig.submit(kind="collect", on=True)
     panel = Panel(rig, pic_h=a.pic_h)
     try:
         panel.run()
@@ -70,6 +75,9 @@ def main(argv=None) -> int:
     finally:
         print("    停线程…", flush=True)
         stopped = rig.stop()
+        # **数据集收尾**（2026-10-20）：`finalize()` 只写这一次，漏了整份数据读不出来。
+        # 它只碰磁盘、不碰串口，所以放在 `stop()` 之后是安全的。
+        rig.collect_close("退出面板")
         # **回初始位置放在 `stop()` 之后、`close()` 之前**（2026-10-17 用户要的）：
         # `stop()` 已经把硬件线程停了、这一刻臂上没有别人；串口和相机还开着，走得动。
         # 走完再关，这样下次开机不是从「刚才随手停在哪」起算的。

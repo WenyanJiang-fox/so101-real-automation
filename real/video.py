@@ -14,6 +14,20 @@ from pathlib import Path
 import numpy as np
 
 
+def stamp(img, text: str, org=(14, 40), scale: float = 0.9, thick: int = 2):
+    """在帧上烧一行 ASCII 文字（黑描边 + 白字）。
+
+    **只用 ASCII**：这套 cv2 没有 freetype，中文会画成一排 `?`。白/黑两个颜色不随
+    通道顺序变（RGB 和 BGR 里三通道都相等），所以调用方给哪种都行。
+    """
+    import cv2
+
+    for line_w, color in ((thick + 3, (0, 0, 0)), (thick, (255, 255, 255))):
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, line_w,
+                    cv2.LINE_AA)
+    return img
+
+
 def write_mp4(path: Path, frames: list, fps: float) -> None:
     """RGB 帧列表 -> mp4。`frames` 里每项是 HxWx3 的 uint8（RGB，不是 BGR）。
 

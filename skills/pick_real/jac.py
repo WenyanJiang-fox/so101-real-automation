@@ -74,16 +74,27 @@ def probe(arm, cam, percep):
 
 
 def dq_for(J, dp_px) -> np.ndarray | None:
-    """阻尼最小二乘：`dq = J⁺·dp`，再把最大的一维夹到 `JAC_STEP_DEG`。"""
+    """阻尼最小二乘：`dq = J⁺·dp`，再把最大的一维夹到 `JAC_STEP_DEG`。
+
+    **返回的是六个关节的增量**（和 `arm._ticks_to_qpos()` 同一个长度）。`J` 只有被探
+    的那五列（`JAC_PROBE_JOINTS = 0~4`），没探的那一维（夹爪 5 号）补 0。
+
+    2026-10-20 修：原来只返回那五个数，调用方 `align.py:723` 拿它去加六个数
+    （`_q0 + _dq`），当场 `ValueError: operands could not be broadcast (6,) (5,)` ——
+    整趟技能从这里抛出去。**不是补个 `[:5]`，是把缺失的那一维按 0 补齐**：夹爪那一步
+    本来就不该动，后面 `_qc[5]` 另有赋值。
+    """
     dp = np.asarray(dp_px, dtype=np.float64).reshape(-1)[:2]
     if not np.all(np.isfinite(dp)) or float(np.linalg.norm(dp)) < 1e-9:
         return None
     A = J @ J.T + (JAC_DAMP ** 2) * np.eye(2)
     try:
-        dq = J.T @ np.linalg.solve(A, dp)
+        dq5 = J.T @ np.linalg.solve(A, dp)
     except np.linalg.LinAlgError:
         return None
-    m = float(np.max(np.abs(dq))) if dq.size else 0.0
+    m = float(np.max(np.abs(dq5))) if dq5.size else 0.0
     if m > JAC_STEP_DEG > 0.0:
-        dq = dq * (JAC_STEP_DEG / m)
+        dq5 = dq5 * (JAC_STEP_DEG / m)
+    dq = np.zeros(6, dtype=np.float64)
+    dq[list(JAC_PROBE_JOINTS)] = dq5
     return dq

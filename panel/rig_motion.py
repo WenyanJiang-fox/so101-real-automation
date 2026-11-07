@@ -67,15 +67,17 @@ class MotionMixin:
     def _grip(self, to, deg) -> None:
         """开爪 / 合爪。**走关节空间**，只动 6 号那一维，别的关节一个字节不写。
 
-        合到底 = `arm.grip_lo`，张到最大 = `arm.grip_hi` —— 这两个数是**从 MJCF 的
-        关节 range 读的**（`real/arm.py:161 joint_limits`），不是这儿写死的。
+        合到底 = `arm.grip_lo`（MJCF 下限）；张开 = `arm.grip_open`（`real/arm.py`
+        的 `GRIP_OPEN_DEG` = 20°，2026-10-21 用户定，**不是** `grip_hi` 那个 MJCF 上限）。
         """
         q0 = self.arm._ticks_to_qpos(self.arm.read_ticks())
         q1 = np.array(q0, dtype=np.float64, copy=True)
         if to == "close":
             q1[5], what, en = float(self.arm.grip_lo), "合到底", "grip CLOSE"
         elif to == "open":
-            q1[5], what, en = float(self.arm.grip_hi), "张到最大", "grip OPEN"
+            q1[5], what, en = (float(getattr(self.arm, "grip_open",
+                                            self.arm.grip_hi)),
+                               "张到 20°（上限）", "grip OPEN")
         elif to == "deg" and deg is not None:
             q1[5] = float(np.clip(np.radians(float(deg)), self.arm.grip_lo,
                                   self.arm.grip_hi))
@@ -229,7 +231,7 @@ class MotionMixin:
         self._status = "measuring grip travel"
         self._log("量夹爪行程两端：先合到底，再张到最大（爪子会动）")
         empty = measure_empty(ctrl)
-        opened = measure_open(ctrl)
+        opened = measure_open(ctrl, tick=self.arm.grip_open_tick)
         if empty is None or opened is None:
             self._log("✗ 行程两端没量出来（舵机没回话），判据沿用上一趟的")
             return

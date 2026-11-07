@@ -12,3 +12,15 @@ __pycache__/
 
 # 临时输出
 _scratch_out.txt
+
+# 本地密钥（KEY=VALUE 形式，代码启动时会读）
+secrets.env
+
+# 面试资料（第三方论文 PDF，不公开）
+docs/interview/
+
+# 本地数据集与 PPO 运行记录
+# datasets/ 平均 1.9GB，不随仓库发布
+datasets/
+ppo/runs/
+out_single_verify/

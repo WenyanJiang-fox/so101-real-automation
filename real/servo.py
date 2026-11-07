@@ -704,7 +704,7 @@ def main() -> int:                                            # noqa: C901
         # 爪子放回「原来那样」——「原来那样」也是闭的。合着爪往下扎只会把盒子推走，
         # 所以这里显式张开，不指望上游。
         q_open = arm._ticks_to_qpos(arm.read_ticks())
-        q_open[5] = float(arm.grip_hi)
+        q_open[5] = float(getattr(arm, "grip_open", arm.grip_hi))
         mv.to(q_open, "OPEN  gripper before descending", ["wide open, then align / descend"])
         q_ref = arm._ticks_to_qpos(arm.read_ticks())
 
@@ -937,7 +937,7 @@ def main() -> int:                                            # noqa: C901
         # ---------- 9. 松爪 ----------
         say(f"松爪前再确认还夹着：比空夹高 {g_deg - empty_deg:.1f}°")
         q = arm._ticks_to_qpos(arm.read_ticks())
-        q[5] = float(arm.grip_hi)
+        q[5] = float(getattr(arm, "grip_open", arm.grip_hi))
         mv.to(q, "OPEN", ["releasing"])
         time.sleep(0.5)
         say(f"松爪：读回 {np.degrees(arm.grip_q()):.1f}°")

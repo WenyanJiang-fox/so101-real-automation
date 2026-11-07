@@ -66,7 +66,8 @@ def main() -> int:
         deg_min, deg_max = min(deg_min, deg), max(deg_max, deg)
         n_bad_reach += bool(geom.out_of_reach(xy))
         n_bad_far += bool(d < PR.PLACE_AWAY_M)
-        n_bad_deg += bool(abs(deg - base_deg) > PR.PLACE_DEG_WIN + 1e-6)
+        n_bad_deg += bool(deg > base_deg + PR.PLACE_DEG_LEFT + 1e-6
+                          or deg < base_deg - PR.PLACE_DEG_RIGHT - 1e-6)
         if i == 0:
             print(f"   头一次：({xy[0] * 1000:.0f}, {xy[1] * 1000:.0f})mm —— {why}")
     print(f"   半径实测 {r_min * 1000:.0f}~{r_max * 1000:.0f}mm"
@@ -74,8 +75,8 @@ def main() -> int:
           f"可达环内 {'✓' if not n_bad_reach else '✗'}）")
     print(f"   离原处最近 {d_min * 1000:.0f}mm（要 ≥{PR.PLACE_AWAY_M * 1000:.0f}）"
           f"   越界次数 {n_bad_far}")
-    print(f"   方位实测 {deg_min:+.1f}~{deg_max:+.1f}°（窗 {base_deg:+.1f}±"
-          f"{PR.PLACE_DEG_WIN:.0f}）   越界次数 {n_bad_deg}")
+    print(f"   方位实测 {deg_min:+.1f}~{deg_max:+.1f}°（窗 {base_deg:+.1f}"
+          f" 左+{PR.PLACE_DEG_LEFT:.0f}/右-{PR.PLACE_DEG_RIGHT:.0f}）   越界次数 {n_bad_deg}")
     print(f"   → 够不着 {n_bad_reach} / 太近 {n_bad_far} / 跑出方位窗 {n_bad_deg}")
 
     print("\n== 2. 松爪高度算式")

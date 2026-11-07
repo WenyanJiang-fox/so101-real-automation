@@ -1,0 +1,41 @@
+{
+  "_note": "策略 = 一组参数覆盖，不是一份新技能。改这里不用改 Python；大模型以后只产出这个文件里的一条。",
+  "default": "oneshot",
+  "ladder": ["oneshot", "full", "vla_end"],
+  "stop_on": ["no_detect"],
+  "strategies": {
+    "oneshot": {
+      "label": "一步到位",
+      "grasp_z_final_mm": 2.0,
+      "skip_clearance": true,
+      "note": "跳过合爪前微调，固定爪尖直接到算出来的落点。2026-10-17 真机实测抓成（out/oneshot_011017.log）"
+    },
+    "full": {
+      "label": "微调版",
+      "grasp_z_final_mm": -1.0,
+      "skip_clearance": false,
+      "note": "现行完整路径：画面雅可比微调 + 中心 -1mm。2026-10-20 采集实测 0/3，全部停在合爪之前"
+    },
+    "vla_end": {
+      "label": "腕子对齐后交给 VLA",
+      "grasp_z_final_mm": 2.0,
+      "skip_clearance": false,
+      "vla_end": "after_align",
+      "note": "2026-10-25：脚本跑到「腕子对上方块侧面」为止；下探、横向对齐、合爪三件事交给 π0.5。夹没夹住仍由脚本判（_close_and_lift 的 already_closed 那一支）"
+    }
+  },
+  "retry_same": ["slip"],
+  "ppo": {
+    "max_attempts": null,
+    "note": "采集时由 ppo/policy.py 接管重试：null = 不限次数，每次只换一个变量；填数字 = 跑满就停"
+  },
+  "next_on_fail": {
+    "off_axis": ["full"],
+    "too_low": ["oneshot"],
+    "too_high": ["full"],
+    "no_gap": ["full"],
+    "slip": ["full"],
+    "descend_fail": ["full"],
+    "other": []
+  }
+}

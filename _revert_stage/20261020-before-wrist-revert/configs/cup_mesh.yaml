@@ -1,0 +1,29 @@
+# 中空的真茶杯那一局：场上是 Google Scanned Objects 扫出来的那只瓷盅
+# （`BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup`），配红方块、蓝球当干扰项。
+#
+# 跟 `cup.yaml` 的差别只有一处：那边是 nexus 的**实心圆柱**（一个视角看不出空心），
+# 这边是**真的扫描网格**，碰撞几何是 coacd 拆出来的凸块 —— 碗壁是真的、口里是空的，
+# 爪子从碗壁两侧对夹，指垫贴在弧面上。
+#
+# 尺寸这一栏（毫米）是从网格自己的顶点读出来的乘上缩放，不是目测：
+# 原扫描件高 43.3mm、底半径 36.1、顶半径 43.6；夹爪最大开口 55.9mm，原尺寸外径
+# 88.7mm 圈不住，按 scale 0.507 缩到下面这组。
+arm:    sim
+cams:   [sim_wrist, sim_overhead]
+
+objects:
+  # 瓷盅。`shape: ramekin` 决定两件事：nexus 生成的指令是 `Pick up the ramekin.`，
+  # 感知的词表也照这个词去找（`_want_index`）。`gso:` 一给就走网格那条路，尺寸键
+  # （bottom/top/height）只是形状表用的，nexus 不读。
+  - {shape: ramekin, color: white,
+     gso: BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup, scale: 0.507,
+     bottom_diameter_mm: 36.6, top_diameter_mm: 44.2, height_mm: 22.0, cup: true}
+  - {shape: cube,   color: red,  side_mm: 30}
+  - {shape: sphere, color: blue, diameter_mm: 40}
+
+perception: siglip2
+policy: expert
+judge:  truth
+
+rounds: 1
+seed:   0

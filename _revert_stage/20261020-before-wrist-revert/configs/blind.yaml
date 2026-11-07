@@ -1,0 +1,31 @@
+# 盲测：桌上随机抽一件东西摆上去，**只告诉它颜色**，形状和尺寸一个字不说。
+#
+# 跟 `default.yaml` 的差别就三处，都跟「答案收在谁手里」有关：
+#   objects    空着 —— 摆什么由 `--blind` 当场抽（`core/blind.py`），抽出来的
+#              真值只喂给仿真和判官
+#   judge      grasp —— 这一支的任务是「抓起来」，不往下放，`truth` 判的是落点，
+#              拿它判抓取永远是 0（见 `impls/judge_grasp.py`）
+#   perception nearest —— 场上就一件东西，按坐标取最近的那一个就够了（基线，不依赖
+#              模型；也就不会因为「清单里没写形状、跟模型的句子对不上」而挑不出来）
+#
+# 感知那一侧拿到的清单是 `blind.specs_for_policy()` 抹过的：只有颜色，形状是
+# `unknown`。要形状就得走 `blind.shape_of()` —— 它读的是**相机估出来的那一份**。
+# 指令也换成 `blind.task_sentence()`：「Pick up the red object.」（nexus 生成的
+# 那句话里带着形状词，直接用等于把答案递过去）。
+
+arm:    sim
+cams:   [sim_wrist, sim_overhead]
+perception: nearest
+policy: expert
+judge:  grasp                        # 判「抓起来没掉」，不判落点
+goal:   grasp                        # 这一轮到抓起来为止：不往下放（`policy_expert` 里那一支）
+
+rounds: 1
+seed:   0
+
+# 抓几次都没抓起来就收工。一次尝试的墙钟上限给得比 default 宽：这一段里多了一件事
+# —— 进场那一眼要拿十来个候选形状各投一遍剪影猜形状（`vision.estimate_shape`），
+# 比量个位置贵得多。
+max_attempts: 2
+attempt_seconds: 150
+round_seconds: 400

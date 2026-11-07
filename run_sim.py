@@ -408,7 +408,7 @@ def main() -> int:
         # `RealArm` 不认识 `objects=`（场景是仿真照摆件清单建出来的，真机上桌子就是
         # 桌子），串口和速度档从 `real:` 那一段来。
         arm = make("arm", "real", **{k: v for k, v in (cfg.get("real") or {}).items()
-                                     if k in ("port", "speed")})
+                                     if k in ("port", "speed", "fast")})
     else:
         arm = make("arm", cfg.get("arm", "sim"), objects=geom.object_specs(), **extra)
     cam_kw = ({"index": int((cfg.get("real") or {}).get("cam_index", 1))}

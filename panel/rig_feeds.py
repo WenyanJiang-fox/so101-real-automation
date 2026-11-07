@@ -59,6 +59,12 @@ class FeedsMixin:
             self._snap["moving"] = True
             self._snap["m"] = None
             self._snap["step"] = None
+        # **采集时才多做这一件事**（2026-10-20）：`RealRecorder.tick()` 是「这一步要不要
+        # 变成数据里的一帧」，自己按 0.2 秒的闸口节流，没到点就直接返回。它有一次抓帧
+        # （腕 + 侧）和一次写盘，比上面那三行贵得多 —— 所以只在按了「采集」之后才接上。
+        rec = getattr(self, "_rec", None)
+        if rec is not None:
+            rec.tick()
 
     # ---- 画面 ----
 
@@ -82,10 +88,24 @@ class FeedsMixin:
             time.sleep(FRAME_S)
             try:
                 bgr = self._grab()
+                side = getattr(self, "side", None)
+                # **侧视那一帧跟着这条路走，不再另起一条线程**（2026-10-20）：相机
+                # 自己已经有读帧线程（`real/side_cam.py::_grab_loop`），这里只是把
+                # 换了的那一帧抄进快照。`seq()` 没变就不转不拷 —— 一次 `cvtColor`
+                # 在 860×900 上约 1~2ms，没必要每 80ms 白做一遍。
+                new_side = (side is not None and side.seq() != self._side_seq)
+                side_bgr = None
+                if new_side:
+                    self._side_seq = side.seq()
+                    side_bgr = cv2.cvtColor(np.asarray(side.shot()),
+                                            cv2.COLOR_RGB2BGR)
                 with self._lock:
                     snap = dict(self._snap)
                     snap["bgr"] = bgr
                     snap["t"] = time.time()
+                    if side_bgr is not None:
+                        snap["side_bgr"] = side_bgr
+                        snap["side_t"] = time.time()
                     self._snap = snap
             except Exception as exc:                                # noqa: BLE001
                 self._log(f"✗ 抓帧出错：{type(exc).__name__}: {exc}")
@@ -136,6 +156,10 @@ class FeedsMixin:
                      "moving": self._moving, "status": self._status,
                      "last_skill": self._last_skill,
                      "auto": self._auto, "round": self._round,
+                     "collect": self._collect, "n_ok": self._n_ok,
+                     "n_bad": self._n_bad, "consec": self._consec,
+                     "strategy": self._strat,
+                     "strategy_label": self._strat_label,
                      "gate": self._gate_state(),
                      # 技能当前段（`RoundState.seg`）。跑完不清 —— 续跑按钮靠它。
                      "stage": str(getattr(self._skill_state, "seg", "") or ""),
@@ -243,10 +267,13 @@ class FeedsMixin:
 
     @staticmethod
     def _fresh_snapshot() -> dict:
-        return {"bgr": None, "ok": False, "angles_deg": None, "angles_src": "",
+        return {"bgr": None, "side_bgr": None, "side_t": 0.0,
+                "ok": False, "angles_deg": None, "angles_src": "",
                 "target": "",
                 "tcp": None, "tips": None, "joint_q": None, "ticks": None,
                 "grip_deg": None, "grip_src": "", "busy": False, "moving": False,
                 "status": "starting", "m": None, "box": None, "facts": None,
                 "step": None, "last_skill": None, "auto": False, "round": 0,
+                "collect": False, "n_ok": 0, "n_bad": 0, "consec": 0,
+                "strategy": "", "strategy_label": "",
                 "gate": None, "stage": "", "t": 0.0}

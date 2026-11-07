@@ -112,15 +112,19 @@ def measure_empty(controller, samples: int = 5, settle: float = 0.8):
     return read_gripper_deg(controller, samples=samples)
 
 
-def measure_open(controller, samples: int = 5, settle: float = 0.8):
-    """张到最大，读回那个角度 —— 行程的**另一头**。
+def measure_open(controller, samples: int = 5, settle: float = 0.8,
+                 tick: int | None = None):
+    """张到 `tick`，读回那个角度 —— 行程的**另一头**。
 
     为什么要有这一头：判「夹住」只写「比空抓基准高」是不够的（见 `classify_ref`），
     一只完全张开的爪也「比基准高」。量出张开那头，判据才能要求读数**卡在两头中间**。
+
+    **`tick` 必给**（`RealArm.grip_open_tick`）。用户 2026-10-21 定：任何时候张开
+    爪子都不许超过 20° —— 这个量测原来张到 180°（3072 刻），是唯一一处越限的。
     """
     from servo_bridge import open_gripper, read_gripper_deg   # noqa: PLC0415
 
-    open_gripper(controller, speed=0)
+    open_gripper(controller, speed=0, tick=tick)
     time.sleep(settle)
     return read_gripper_deg(controller, samples=samples)
 

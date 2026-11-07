@@ -49,6 +49,15 @@ from panel.rig_motion import MotionMixin                        # noqa: E402
 __all__ = ["Rig", "DEFAULT_CONFIG", "TICK_S", "PERCEP_S", "GATE_FRESH_S",
            "FRAME_S", "load_cfg"]
 
+#: 一集少于这么多帧就不存 —— 和 `collect_real_dataset.py` 同一条规矩
+#: （正常一集 600~900 帧；20 帧都不到的必然是中途异常）。
+MIN_FRAMES = 20
+#: **同一支连败这么多趟就换下一支**（用户 2026-10-20：「抓不成功就可以换」）。
+#: 每趟仍然只合一次爪 —— 换的是下一趟的参数，不是这一趟重试。
+TRIES_PER_STRAT = 1
+#: 一轮采集最多跑这么多趟（成功的也算）。防止面板没人看着的时候一直跑下去。
+MAX_ATTEMPTS = 8
+
 
 class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
     """一套真机装备 + 一个跑它的线程。界面只调 `submit()` / `snap()`。"""
@@ -70,9 +79,23 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         # 开关只由面板那几个按钮/键改；`stop`、断点上「放弃」都会把它关掉。
         self._auto = False
         self._round = 0
-        # **换抓取方向**（用户 2026-10-19）：0 = 按形状自己挑，90 = 去对另一对侧面。
-        # 开关是面板上那个按钮；自动连跑时一直沿用这个值。
-        self.grasp_side_deg = 0.0
+        # **自动采集数据**（2026-10-20 用户：自动采集，但要有个面板看着）。
+        # 开着的时候 = 自动连跑 + 每一趟录成 LeRobot 的一集；`held` 存盘、其余丢掉。
+        # `_rec` 是 `real/recorder.py::RealRecorder`，只有采集期间不为 None。
+        self._collect = False
+        self._rec = None
+        self._n_ok = 0                  # 这一轮采集存下的集数
+        self._n_bad = 0                 # 这一轮采集丢掉的集数
+        self._consec = 0                # 同一支策略连败几趟了
+        # **策略阶梯**（用户 2026-10-20）：一次不行换下一支，不是换参数重跑。
+        # 名字和参数都在 `configs/strategies.json`；这里只记「这一轮试过哪些」。
+        self._strat = ""
+        self._strat_label = ""
+        self._strat_tried: set[str] = set()
+        # **重试策略**（用户 2026-10-20）：采集期间由 `ppo/policy.py` 接下一趟换什么 ——
+        # 不限次数，每次只换一个变量，按实测精进。手动跑（不是采集）时它是 None，
+        # 面板上的策略按钮还是原来那套。
+        self._ppo = None
         self._status = "starting"
         # 最近一次技能的结果（`_run_pick` 写、界面读）。没跑过就是 None。
         self._last_skill: dict | None = None
@@ -85,12 +108,22 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         self._snap: dict = {}
         self._t_frame = 0.0
         self._t_percep = 0.0
+        #: 侧视那一帧抄到第几号（`SideCamera.seq()`）。没变就不重复转 BGR。
+        self._side_seq = -1
         # 下一眼感知的起搜中心（米，基座系）。**就是上一眼认出来的那个真位置** ——
         # 不用加也不用扣 `percep_offset_mm`，`locate` 交出来的数已经扣过了。
         # 还没认出来过就是 None，那时 `locate` 用配置里的 `pick_xy_mm` 起搜。
         self._seed = None
 
         self._assemble(cfg_path, port=port, cam_index=cam_index)
+        # 策略表读不出来不拦启动：照技能里写死的默认值跑，日志里说清楚。
+        try:
+            from skills.pick_real import strategy as _strategy    # noqa: PLC0415
+            self._strat = _strategy.default_name()
+            self._strat_label = _strategy.label(self._strat)
+        except Exception as exc:                                    # noqa: BLE001
+            self._log(f"✗ 策略表读不出来：{type(exc).__name__}: {exc}"
+                      " —— 照技能里的默认值跑")
 
         self._thr = threading.Thread(target=self._loop, name="rig", daemon=True)
         # 感知那条线程（`_percep_loop`）。**它自己占 CPU**，硬件线程不等它。
@@ -163,7 +196,7 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
                 cmd = self._q.get_nowait()
             except queue.Empty:
                 break
-            if cmd.get("kind") in ("home", "pick_run", "replay_run"):
+            if cmd.get("kind") in ("home", "pick_run"):
                 continue
             keep.append(cmd)
         for cmd in keep:
@@ -262,18 +295,12 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
                         self._moving = False
                 # **自动模式接下一趟。** 放在这里（`finally` 之后、循环里）：这一趟
                 # 不管成没成都接着来；先回家再跑 —— 失败那趟可能停在半路。
-                if (cmd.get("kind") in ("pick_run", "replay_run") and self._auto
+                if (cmd.get("kind") == "pick_run" and self._auto
                         and not self._quit.is_set()):
                     self._round += 1
-                    # **有了上一次抓成的关节记录就先回放**（用户 2026-10-19）。
-                    # 回放里没夹住会自己退回 `_run_pick`，所以这里只决定先试哪条。
-                    from real import joint_rec as _jrec             # noqa: PLC0415
-
-                    nxt = ("replay_run" if _jrec.has_recording() else "pick_run")
-                    self._log(f"↻ 自动模式：第 {self._round} 轮收工 → 回初始位置 → "
-                              f"下一趟（{'关节回放' if nxt == 'replay_run' else '正常逻辑'}）")
+                    self._log(f"↻ 自动模式：第 {self._round} 轮收工 → 回初始位置 → 下一趟")
                     self._q.put({"kind": "home"})
-                    self._q.put({"kind": nxt})
+                    self._q.put({"kind": "pick_run"})
             now = time.time()
             if now - self._t_frame >= TICK_S:
                 try:
@@ -295,7 +322,15 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
             self.arm.terminated = True
             self._auto = False
             self._log("⏹ 停手 —— 轨迹走到当前这一点就停，不松力矩；自动模式已关")
+            # **采集跟着停**：数据集要 `finalize()` 才读得出来，不关的话这一轮白录。
+            self._collect_off("停手")
             self._status = "stopped"
+            return
+        if kind == "collect":
+            self._collect_cmd(bool(cmd.get("on")))
+            return
+        if kind == "strategy":
+            self._strategy_cmd(cmd.get("name"))
             return
         if kind == "auto":
             # 不动作、不碰串口 —— 只翻开关。开的时候顺手排一趟；已经在跑的话，
@@ -310,6 +345,9 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
                 # **关掉的时候把还排着的扔掉**（用户 2026-10-18）：FIFO 里那几条
                 # `home` / `pick_run` 不扔的话，会紧接着把这一趟又跑起来。
                 self._drain_queue()
+                # 采集是靠自动连跑驱动的，连跑关了它就没有下一趟了 —— 一起收掉，
+                # 免得数据集停在一个没 `finalize` 的半成品状态。
+                self._collect_off("自动连跑关掉")
             return
         if kind == "estop":
             # 从 `pump_wait` 进来时（技能停在断点上），这里要当场做完，不能只是置个
@@ -340,14 +378,6 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         if kind == "grip_cal":
             self._measure_grip_range()
             return
-        if kind == "grasp_side":
-            # **只改一个数，不动臂**（跟 `gate` 一样放在 `terminated = False` 之前）。
-            self.grasp_side_deg = float(cmd.get("deg", 0.0) or 0.0)
-            self._log("换抓取方向：" + (
-                "关（按形状自己挑那一对）" if abs(self.grasp_side_deg) < 1e-6 else
-                f"开（参考轴转 {self.grasp_side_deg:+.0f}°，去对另一对侧面）"))
-            return
-
         if kind == "gate":
             # **放在这一组里**（跟 `see` / `torque` 一样，在 `terminated = False` 之前）：
             # 写文件不动臂，不该顺手把「停手」那个标志清掉。
@@ -368,8 +398,6 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
                         float(cmd.get("dz", 0.0)))
         elif kind == "pick_run":
             self._run_pick(str(cmd.get("instruction") or ""), cmd.get("start_at"))
-        elif kind == "replay_run":
-            self._run_replay(str(cmd.get("instruction") or ""))
         else:
             self._log(f"？不认识的命令 {kind!r}")
 
@@ -442,6 +470,136 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
             return "手里抓着东西，不能续跑"
         return ""
 
+    # ---- 自动采集：自动连跑 + 每一趟录一集 ----
+
+    def _strategy_cmd(self, name: str | None = None) -> None:
+        """换一支策略。**不碰舵机** —— 真正的套用发生在下一趟开跑之前（`_run_pick`）。
+
+        不给名字就按阶梯顺序转下一个。手动换过之后把「这一轮试过哪些」清空，
+        这样自动采集还能从头走一遍阶梯。
+        """
+        from skills.pick_real import strategy as _strategy          # noqa: PLC0415
+
+        ns = _strategy.names()
+        if not ns:
+            self._log("✗ 策略表里一条也没有（`configs/strategies.json`）")
+            return
+        if name:
+            nxt = str(name)
+        else:
+            cur = self._strat if self._strat in ns else ns[0]
+            nxt = ns[(ns.index(cur) + 1) % len(ns)]
+        self._strat = nxt
+        self._strat_label = _strategy.label(nxt)
+        self._strat_tried = set()
+        self._consec = 0
+        self._log(f"[策略] 下一趟用「{self._strat_label}」（{nxt}）")
+
+    def _collect_cmd(self, on: bool) -> None:
+        """采集的开关。**不碰舵机**，只开/关数据集和自动连跑。"""
+        if on:
+            self._collect_on()
+        else:
+            self._collect_off("手动关掉")
+
+    def _collect_on(self) -> None:
+        """开始采集：建数据集 → 打开自动连跑 → 排「回初始位置 + 跑一趟」。
+
+        **侧相机打不开就不开始**（2026-10-20）：两路相机是写进 `meta/info.json` 的
+        feature，少一路录出来是另一份格式，混在一个目录里读不出来。宁可当场说清楚。
+        """
+        if self._rec is not None:
+            return
+        if self.side is None:
+            self._log("✗ 采集开始不了：侧相机没打开（看装配那几行的报错），"
+                      "这一版只能录腕相机 —— 不开始，免得录成半份格式")
+            return
+        cfg = dict(self.cfg.get("collect") or {})
+        root = cfg.get("root")
+        repo = cfg.get("repo_id")
+        if not root or not repo:
+            self._log("✗ 采集开始不了：`configs/real.yaml` 的 `collect:` 缺 `root` / `repo_id`")
+            return
+        from real.recorder import RealRecorder                      # noqa: PLC0415
+
+        task = f"pick up the {self.color} box"
+        try:
+            self._rec = RealRecorder(root, repo, task,
+                                     fps=int(cfg.get("fps", 4)),
+                                     size=cfg.get("size", "960x540"),
+                                     side=self.side)
+        except Exception as exc:                                    # noqa: BLE001
+            self._rec = None
+            self._log(f"✗ 数据集打不开：{type(exc).__name__}: {exc}")
+            return
+        self._collect = True
+        self._n_ok = 0
+        self._n_bad = 0
+        self._consec = 0
+        self._strat_tried = set()
+        self._auto = True
+        self._round = 0
+        # **重试交给 `ppo/`**（用户 2026-10-20）：不限次数，每次只换一个变量。
+        # 上限从 `configs/strategies.json` 的 `ppo.max_attempts` 读；没写 = 不限。
+        try:
+            from skills.pick_real import strategy as _strategy      # noqa: PLC0415
+
+            cap = (_strategy.cfg().get("ppo") or {}).get("max_attempts")
+        except Exception:                                           # noqa: BLE001
+            _strategy, cap = None, None
+        from ppo.policy import RetryPolicy                          # noqa: PLC0415
+
+        self._ppo = RetryPolicy(max_attempts=cap)
+        from skills import pick_real as _pr                         # noqa: PLC0415
+
+        _pr.knobs.ANCHOR_XY = None
+        self._log(f"● 采集开始：任务「{task}」→ {root}")
+        self._log("   每一趟：闸口全关、抓成存盘、没抓成丢掉；"
+                  f"重试由 ppo/ 接管 —— {'不限次数' if cap is None else f'最多 {cap} 次'}，"
+                  "每次只换一个变量")
+        try:
+            from skills.pick_real import strategy as _strategy      # noqa: PLC0415
+            self._log("   策略阶梯：" + " → ".join(
+                _strategy.label(n) for n in _strategy.names())
+                + f"（现在从「{self._strat_label or self._strat}」起）")
+        except Exception:                                           # noqa: BLE001
+            pass
+        # 和自动连跑同一条路：先回家，再跑。之后每一趟收工由 `_loop` 接着排。
+        self._q.put({"kind": "home"})
+        self._q.put({"kind": "pick_run"})
+
+    def _collect_off(self, why: str = "") -> None:
+        """停采集并**把数据集收尾**（`finalize()`）。不调这一步整份数据读不出来。
+
+        只碰磁盘，不碰串口 —— 所以主线程在 `stop()` 之后也能安全地调（`__main__` 用）。
+        """
+        self._collect = False
+        self._auto = False
+        # **重试账本先交账**：这一轮试了几次、每档各成几次、开口最大多少。
+        if self._ppo is not None:
+            self._log("[重试] 收工：" + self._ppo.summary())
+            self._ppo = None
+        try:
+            from skills import pick_real as _pr                     # noqa: PLC0415
+
+            _pr.knobs.ANCHOR_XY = None
+        except Exception:                                           # noqa: BLE001
+            pass
+        rec, self._rec = self._rec, None
+        if rec is None:
+            return
+        root = rec.root
+        try:
+            rec.close()
+        except Exception as exc:                                    # noqa: BLE001
+            self._log(f"✗ 数据集收尾出错：{type(exc).__name__}: {exc}")
+        self._log(f"■ 采集结束（{why or '收工'}）：成功 {self._n_ok} 集 / "
+                  f"失败 {self._n_bad} 集 → {root}")
+
+    def collect_close(self, why: str = "退出面板") -> None:
+        """退出时调一次。`finalize()` 只做这一次，别让数据集停在半成品。"""
+        self._collect_off(why)
+
     def _run_pick(self, instruction: str, start_at: str | None = None) -> None:
         """跑一整趟。**这是整条链里唯一会走完整策略的地方。**
 
@@ -458,8 +616,7 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         name = instruction or skill_driver.INSTRUCTION
         self._status = "skill: pick"
         if start_at:
-            says = {"align": "对准", "fine": "微调", "close": "下探一截并合爪",
-                    "place": "照上一趟的放置记录去抓"}
+            says = {"align": "对准", "fine": "微调", "close": "下探一截并合爪"}
             self._log(f"↻ 从断点接着走：入口「{says.get(start_at, start_at)}」"
                       f"（上一趟停在「{getattr(self._skill_state, 'seg', '?')}」）")
         elif self._auto:
@@ -470,36 +627,67 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
             # 跑的时候别拿上一拍的读数糊弄人：`step` 清掉，界面就会显示「在动」。
             self._snap["step"] = None
             self._snap["moving"] = True
-        t0 = time.time()
-        # **顺手录下这一趟的关节指令**（用户 2026-10-19）。录成不成功都要停止录，
-        # 只有抓成并放好了才落盘 —— 下一轮回放的是「上一次成功」那条轨迹。
-        from real import joint_rec                                      # noqa: PLC0415
+        # **这一趟要不要录。** `_rec` 只在采集期间存在；`on_start` 在技能自己的
+        # `RoundState` 建好之后立刻回调，录制要靠 `state.seg` 判「从哪一段开始录」。
+        rec = self._rec if self._collect else None
 
-        rec = joint_rec.begin(self.arm)
-        try:
-            out = skill_driver.run_pick(self, name, gates=not self._auto,
-                                        start_at=start_at,
-                                        grasp_side=self.grasp_side_deg)
-        finally:
-            joint_rec.end()
+        def _on_start(state) -> None:
+            if rec is not None:
+                rec.start(self.arm, self.cam, state)
+
+        # **重试策略接管这一趟的参数**（`ppo/`，用户 2026-10-20）：第几次、换哪个变量、
+        # 定位锚点。套在「套用策略」之前 —— 它改的就是 `self._strat`。
+        if self._collect and self._ppo is not None:
+            act, change = self._ppo.choose()
+            self._strat = act.strategy
+            os.environ["PICK_CLEARANCE_MEASURE"] = "1" if act.measure else "0"
+            from skills import pick_real as _pr                     # noqa: PLC0415
+
+            _pr.knobs.ANCHOR_XY = self._ppo.anchor
+            where = ("" if self._ppo.anchor is None else
+                     f"；锚点 ({self._ppo.anchor[0] * 1000:.0f}, "
+                     f"{self._ppo.anchor[1] * 1000:.0f})mm")
+            self._log(f"[重试] 第 {self._ppo.n + 1} 次：{act.label}（{change}）{where}")
+
+        # **套用策略**（用户 2026-10-20）：只在这一刻写技能里那几个名字 —— 跑起来之后
+        # 不许再换，免得同一趟前后两半用两套参数。换策略只影响下一趟。
+        if self._strat:
+            try:
+                from skills.pick_real import strategy as _strategy   # noqa: PLC0415
+                sp = _strategy.apply(self._strat)
+                self._strat_label = str(sp.get("label") or self._strat)
+                self._log(f"[策略] {self._strat_label}：下探终点 "
+                          f"{float(sp.get('grasp_z_final_mm', -1.0)):+.1f}mm，"
+                          f"{'跳过' if sp.get('skip_clearance') else '走'}合爪前微调")
+            except Exception as exc:                                # noqa: BLE001
+                self._log(f"✗ 策略套用失败（{self._strat}）："
+                          f"{type(exc).__name__}: {exc} —— 照技能里的默认值跑")
+
+        t0 = time.time()
+        out = skill_driver.run_pick(self, name, gates=not self._auto,
+                                    start_at=start_at, on_start=_on_start)
+        # **先收这一趟的实测**（`ppo/policy.py`）：6 号停几度、方块被推多少、
+        # 下探之后中心在哪 → 下一趟的锚点。**必须在 `begin_target()` 之前** ——
+        # 先清账本再记账，这一趟就会记成「第 1 次、起始档」。
+        if self._collect and self._ppo is not None:
+            self._log("[重试] " + self._ppo.observe(out))
+        # **这一趟放下的位置 = 下一趟的起搜中心**（用户 2026-10-20：「目标是由上一趟
+        # 放下的」）。不写成文件、不跨进程 —— 自动连跑全在同一个进程里。
+        place = out.get("place") or {}
+        if place.get("ok") and place.get("at"):
+            from skills import pick_real as _pr                     # noqa: PLC0415
+
+            _pr.knobs.GUESS_XY = (float(place["at"][0]), float(place["at"][1]))
+            self._log(f"[下一趟] 起搜中心 = 这一趟放下的位置 "
+                      f"({float(place['at'][0]) * 1000:.0f}, "
+                      f"{float(place['at'][1]) * 1000:.0f})mm")
+            # **换目标了**：次数、试过哪几档、锚点全清 —— 下一只方块从头来。
+            if self._ppo is not None:
+                self._ppo.begin_target()
+        if rec is not None:
+            self._collect_episode(rec, out)
         ok = bool(out.get("ok"))
         why = str(out.get("why") or "")
-        place = out.get("place")
-        placed = bool(place.get("ok")) if isinstance(place, dict) else None
-        if ok and placed is not False:
-            try:
-                path = rec.save({"empty_deg": out.get("empty_deg"),
-                                 "open_deg": getattr(self.arm, "open_deg", None),
-                                 "grip_deg": out.get("grip_deg"),
-                                 "place": place})
-            except Exception as exc:                                # noqa: BLE001
-                path = None
-                self._log(f"⏺ 存关节记录失败：{type(exc).__name__}: {exc}")
-            if path is not None:
-                self._log(f"⏺ 关节记录已存：{path}（{len(rec.rows)} 个点、"
-                          f"{(rec.t[-1] if rec.t else 0):.1f}s）—— 下一轮起先回放它")
-        else:
-            self._log("⏺ 这一趟没成，不覆盖上一次的关节记录")
         self._last_skill = {"ok": ok, "why": why,
                             "give_up": bool(out.get("give_up")),
                             "seconds": time.time() - t0}
@@ -508,115 +696,74 @@ class Rig(AssemblyMixin, MotionMixin, FeedsMixin, GateMixin):
         self._status = "skill done" if ok else "skill stopped"
         self._gate_t = 0.0              # 收工了：断点状态立刻作废，别让面板还挂着按钮
 
-    def _run_replay(self, instruction: str) -> None:
-        """把上一次抓成的那条关节轨迹原样走一遍。
-
-        **在 `lifted` 切点上现读夹爪判夹住没有**（用户 2026-10-19：「抓不到再用我们
-        自己的逻辑」）：判过就继续往下放；判不过就当场停，回初始位置，正常逻辑重跑
-        这一趟（重跑会录下新的轨迹，下一轮接着用）。
+    def _collect_episode(self, rec, out: dict) -> None:
+        """一趟收工：够长且真抓起来了就存，否则丢掉。**判据和采集脚本逐字一样**
+        （`collect_real_dataset.py`）：`ok` + `verdict == "held"` + 没掉 + 帧数够。
         """
-        from panel import skill_driver                                  # noqa: PLC0415
-        from real import joint_rec                                      # noqa: PLC0415
-
-        name = instruction or skill_driver.INSTRUCTION
-        rec = joint_rec.load()
-        marks = (rec or {}).get("meta", {}).get("marks") or []
-        lifted = next((m for m in marks if m.get("name") == "lifted"), None)
-        if rec is None or lifted is None:
-            self._log("⟲ 没有可回放的关节记录（或记录里没有判夹取的切点）"
-                      " —— 直接走正常逻辑")
-            self._run_pick(name)
+        n = rec.stop()
+        ok = (bool(out.get("ok")) and out.get("verdict") == "held"
+              and not out.get("dropped") and n >= MIN_FRAMES)
+        if ok:
+            rec.save()
+            self._n_ok += 1
+            self._consec = 0
+            self._strat_tried.clear()   # 这一支能成：下一趟还从它起，阶梯重新算
+        else:
+            why = str(out.get("why") or ("没抓住" if not ok else f"只录到 {n} 帧"))
+            rec.discard(why)
+            self._n_bad += 1
+            self._consec += 1
+        self._log(f"采集进度：成功 {self._n_ok} / 失败 {self._n_bad}"
+                  f"（这一趟 {n} 帧，策略「{self._strat_label or self._strat}」）")
+        if ok:
             return
-
-        # **记录里抓的是哪个位置**（用户 2026-10-19：回放是为了抓「上一轮摆过去的新位置」
-        # 那只方块）。记录里的抓取中心和方块现在的位置（冻结的落点）对不上时，回放就是
-        # 从盒子旁边空走一趟 —— 第 2 轮必然如此：第 1 轮抓的是拾取位，落点已经换了一处。
-        # 两个落点至少隔 `PLACE_AWAY_M`（60mm），这里 30mm 夹在「量测/落点漂移」和
-        # 「两处位置之间的距离」中间；对不上就直接走正常逻辑，别白跑。
-        from skills.pick_real import randlock                            # noqa: PLC0415
-        from skills.pick_real.knobs import PLACE_AWAY_M                  # noqa: PLC0415
-
-        # **整段回放只对「方块还在记录里那个位置」有效。** 第 2 轮方块已经被第 1 轮
-        # 放到 B 了，整条轨迹是从 A 抓的 —— 那是空走一趟。可上一轮的**放置**记录
-        # （`place_low`）里已经写了方块落在 B 的哪儿、当初是怎么摆着放的（用户
-        # 2026-10-19：「知道怎么放的就能知道怎么抓 B」），照它重新摆一遍就行。
-        low = next((m for m in marks if m.get("name") == "place_low"), None)
-        now_xy = randlock.get("place_xy")
-        got_xy = lifted.get("center")
-        tol_m = min(0.030, PLACE_AWAY_M * 0.5)
-        if got_xy is None or now_xy is None:
-            if low is not None:
-                self._log("⟲ 整段回放对不上（记录里没有抓取位置）—— "
-                          "改走「照上一趟的放置记录去抓」")
-                self._run_pick(name, start_at="place")
-            else:
-                self._log("⟲ 记录里没有抓取位置（旧记录）—— 直接走正常逻辑")
-                self._run_pick(name)
+        # **重试策略在场时，停不停由它说了算**（`ppo/policy.py::should_stop`）：
+        # 只有人喊停、目标找不到、自己设了次数上限这三种才停。
+        if self._ppo is not None:
+            stop, stop_why = self._ppo.should_stop(out)
+            if stop:
+                self._log(f"[重试] 停：{stop_why}")
+                self._collect_off(stop_why)
             return
-        d_m = float(((float(got_xy[0]) - float(now_xy[0])) ** 2
-                     + (float(got_xy[1]) - float(now_xy[1])) ** 2) ** 0.5)
-        if d_m > tol_m:
-            if low is not None:
-                self._log(f"⟲ 记录抓的是 ({float(got_xy[0]) * 1000:.0f}, "
-                          f"{float(got_xy[1]) * 1000:.0f})mm，方块现在在 "
-                          f"({float(now_xy[0]) * 1000:.0f}, "
-                          f"{float(now_xy[1]) * 1000:.0f})mm（差 {d_m * 1000:.0f}mm）"
-                          f"—— 整段回放对不上，改走「照上一趟的放置记录去抓」")
-                self._run_pick(name, start_at="place")
-            else:
-                self._log(f"⟲ 记录抓的是 ({float(got_xy[0]) * 1000:.0f}, "
-                          f"{float(got_xy[1]) * 1000:.0f})mm，方块现在在 "
-                          f"({float(now_xy[0]) * 1000:.0f}, "
-                          f"{float(now_xy[1]) * 1000:.0f})mm"
-                          f"（差 {d_m * 1000:.0f}mm）—— 回放对不上，走正常逻辑")
-                self._run_pick(name)
+        if self._n_ok + self._n_bad >= MAX_ATTEMPTS:
+            self._log(f"这一轮跑满 {MAX_ATTEMPTS} 趟 —— 停采集")
+            self._collect_off("跑满上限")
             return
+        if self._consec >= TRIES_PER_STRAT:
+            self._advance_strategy(out, why)
 
-        self._status = "skill: replay"
-        with self._lock:
-            self._snap["step"] = None
-            self._snap["moving"] = True
-        self._log(f"⟲ 关节回放：原样走上一趟抓成的轨迹（{name}）")
-        t0 = time.time()
-        seen = {"verdict": None}
+    def _advance_strategy(self, out: dict, why: str) -> None:
+        """这一支不行了：按失败码换下一支；阶梯走完就停采集。
 
-        def _on_mark(m: dict):
-            if m.get("name") != "lifted":
-                return None
-            from grasp_check import classify_ref, load_thresholds       # noqa: PLC0415
-            from servo_bridge import read_gripper_deg                   # noqa: PLC0415
-
-            deg = read_gripper_deg(self.arm.ctrl)
-            empty = m.get("empty_deg")
-            cal = load_thresholds()
-            cls = classify_ref(deg, empty, cal, m.get("open_deg"))
-            seen["verdict"] = cls
-            self._log(f"    回放到「抬升完」：6 号 {deg if deg is None else f'{deg:.1f}°'}"
-                      f"  记录的空抓基准 {empty}  判 {cls}")
-            if cls != "held":
-                return False            # 当场停：不往下放
-            return True
-
-        out = joint_rec.replay(self.arm, rec, on_mark=_on_mark)
-        dt = time.time() - t0
-        if out.get("ok"):
-            self._log(f"✓ 回放走完：{out.get('n')} 个点，用时 {dt:.1f}s")
-            self._last_skill = {"ok": True, "why": "关节回放", "give_up": False,
-                                "seconds": dt}
-            self._status = "skill done"
-            self._gate_t = 0.0
+        **技能半路收工（`give_up`）不换策略** —— 那是停手、装配、臂不在姿态上这类
+        问题，换参数不会有任何变化，接着跑只会白跑。
+        """
+        if bool(out.get("give_up")):
+            self._log("这一趟是收工/装配问题，不是抓取策略的事 —— 不换策略")
+            self._collect_off("技能中途收工")
             return
-
-        # 没判过 / 停手 / 记录有问题：**用正常逻辑重跑这一趟**。
-        why = str(out.get("why") or "")
-        if getattr(self.arm, "terminated", False):
-            self._log(f"⟲ 回放被停手（{why}）—— 不再重跑")
-            self._last_skill = {"ok": False, "why": f"回放停手：{why}",
-                                "give_up": True, "seconds": dt}
-            self._status = "skill stopped"
+        try:
+            from skills.pick_real import strategy as _strategy      # noqa: PLC0415
+        except Exception as exc:                                    # noqa: BLE001
+            self._log(f"✗ 策略表读不出来：{type(exc).__name__}: {exc} —— 停采集")
+            self._collect_off("策略表读不出来")
             return
-        self._log(f"✗ 回放没走完：{why}（判 {seen.get('verdict')}）→ "
-                  f"回初始位置，用正常逻辑重跑这一趟")
-        self.arm.terminated = False
-        self._home()
-        self._run_pick(name)
+        c = _strategy.code(why)
+        # **空抓不换策略**（用户 2026-10-20）：合了个空是「这一趟没对上位置」，
+        # 换一支参数只会换一套同样没对上位置的动作 —— `decide.py` 会按实测把终点补回来，
+        # 就在同一支上再扎一趟。换策略留给「轴偏来回摆 / 缝量不了」这类结构性失败。
+        if c in set(_strategy.cfg().get("retry_same") or ()):
+            self._consec = 0
+            self._log(f"失败码 {c}（空抓）：不换策略，同一支「{self._strat_label or self._strat}」"
+                      f"再来一趟")
+            return
+        self._strat_tried.add(self._strat)
+        nxt = _strategy.next_after(c, self._strat_tried)
+        if nxt is None:
+            self._log(f"失败码 {c}，策略阶梯走完了 —— 停采集，不自己造第三条")
+            self._collect_off("策略都用过了")
+            return
+        self._strat = nxt
+        self._strat_label = _strategy.label(nxt)
+        self._consec = 0
+        self._log(f"失败码 {c}：下一趟换「{self._strat_label}」（{nxt}）")

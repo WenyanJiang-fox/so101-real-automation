@@ -43,9 +43,6 @@ GATE_ENV = ("PICK_CONFIRM_STEP", "PICK_CONFIRM", "PICK_CONFIRM_DESCEND")
 # 续跑入口那个环境变量（`align` / `fine` / `close`，见 `skills/pick_real/skill.py::run`）。
 # 它**不是闸口**：自动模式照样会用它，所以不放进 `GATE_ENV`。
 START_ENV = "PICK_START_AT"
-# **换抓取方向**（用户 2026-10-19）：0 = 现状，90 = 去对另一对侧面。
-# 跟 `START_ENV` 一样不是闸口，自动模式照样用。
-SIDE_ENV = "PICK_GRASP_SIDE_DEG"
 
 # 断点登记表：`(读数文件, 短名, 一句话)`。**短名只给面板显示用**，权限按下面 `ALLOWED` 走。
 GATES: tuple[tuple[Path, str, str], ...] = (
@@ -145,7 +142,7 @@ def open_gate(what: str, *, dz_mm: float | None = None) -> str:
 
 
 def run_pick(rig, instruction: str = INSTRUCTION, *, gates: bool = True,
-             start_at: str | None = None, grasp_side: float | None = None) -> dict:
+             start_at: str | None = None, on_start=None) -> dict:
     """跑一整趟，闸口全开 —— 技能自己会在断点上停下来等。
 
     **必须在硬件线程里调**（`panel/rig.py` 的 `_do` 就是从那儿调的）。技能自己会读舵机、
@@ -154,7 +151,7 @@ def run_pick(rig, instruction: str = INSTRUCTION, *, gates: bool = True,
     闸口是**靠环境变量**开的，所以这一趟跑完必须还原 —— 不还原的话，面板上「手动」那一
     套以后每一次动作都带着闸口，技能之外的地方也会莫名其妙停下来。
     """
-    prev_env = {k: os.environ.get(k) for k in (*GATE_ENV, START_ENV, SIDE_ENV)}
+    prev_env = {k: os.environ.get(k) for k in (*GATE_ENV, START_ENV)}
     prev_tick = PR.knobs.WAIT_TICK
     prev_idle = PR.knobs.WAIT_IDLE
     prev_stop = PR.knobs.STOP_AFTER
@@ -164,11 +161,6 @@ def run_pick(rig, instruction: str = INSTRUCTION, *, gates: bool = True,
         os.environ[START_ENV] = str(start_at)
     else:
         os.environ.pop(START_ENV, None)
-    # **换抓取方向**：不给就当 0（不换）。数值由面板那个开关给。
-    if grasp_side is None:
-        os.environ.pop(SIDE_ENV, None)
-    else:
-        os.environ[SIDE_ENV] = str(float(grasp_side))
     # `gates=False` = 自动模式：一个闸口都不开，技能全程自己走（用户 2026-10-18）。
     # 必须主动**清掉**环境变量：上一次手动那趟跑完虽然还原了，但外壳里本来就带着同样的
     # 变量的话，不清就等于闸口还开着。
@@ -190,12 +182,21 @@ def run_pick(rig, instruction: str = INSTRUCTION, *, gates: bool = True,
 
     state = RoundState()
     rig._skill_state = state
+    # **采集要在同一个 `state` 上挂录制**（2026-10-20）：录制靠 `state.seg` 判「从哪一段
+    # 开始记、到哪一段停」，自己另 new 一个就对不上技能真正在走的那一段。
+    if on_start is not None:
+        on_start(state)
     try:
         skill = make("skill", "pick_real")
         out = skill.run(rig.arm, rig.cams, state=state, index=0,
                         percep=rig.percep, instruction=instruction)
         return dict(out) if isinstance(out, dict) else {"ok": bool(out), "why": str(out)}
     except Exception as exc:                                        # noqa: BLE001
+        # **把 traceback 打进日志**（2026-10-20）：只回一行 `IndexError: index out of
+        # range` 看不出是在哪一句抛的，面板日志里连函数名都没有。
+        import traceback                                            # noqa: PLC0415
+
+        traceback.print_exc()
         return {"ok": False, "why": f"技能抛了：{type(exc).__name__}: {exc}", "exc": True}
     finally:
         PR.knobs.WAIT_TICK = prev_tick

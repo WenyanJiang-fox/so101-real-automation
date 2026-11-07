@@ -14,19 +14,101 @@ from core.registry import register
 from core.round_state import RoundState
 import numpy as np
 from . import knobs
-from .knobs import CLOSE_START_STEPS, FIX_CLEAR_REAL, GRASP_Z_MARGIN_REAL, GRASP_Z_OVER_TOP_REAL, HOME_AFTER_PLACE, PLACE_AFTER_PICK, RESUME_TOL_DEG
+from . import vlm_gate as _vlm_gate
+from .knobs import APPROACH_MIN_ABOVE_M, CLOSE_START_STEPS, FIX_CLEAR_REAL, GRASP_Z_MARGIN_REAL, GRASP_Z_OVER_TOP_REAL, HOME_AFTER_PLACE, PLACE_AFTER_PICK, RESUME_TOL_DEG
 from .align import _align, _set_clearance
 from .pose import _align_deg, _declared_half, _fold90, _h, _vertical, _wrist
 from .gates import (_arm_off_checkpoint, _descend_to_grasp, _drop_checkpoint,
-                    _grasp_side_deg, _load_checkpoint, _raise_to_safe, _resume_on,
-                    _save_checkpoint, _start_at, _stop_here)
+                    _load_checkpoint, _raise_to_safe, _resume_on, _save_checkpoint,
+                    _start_at, _stop_here)
+from .vla_end import enabled as _vla_end_on
 from .rulers import _box_deg_px, _jaw_axis_deg, _jaw_axis_model_deg, _jaw_shape, _save_look, _yaw_from_px
 from .grasp import _close_until_stall, _grip_hold, _gripper_deg
-from .motion import _descend, _goto, _trace
+from .motion import _descend, _goto, _goto_reach, _trace
 from .look import _look, _sweep
 from .place import _place_real
+
+#: 末端交给 VLA 的岔口。空串 = 走脚本那一整套（默认）；`"after_align"` = 脚本只管到
+#: 「腕子对上方块侧面」，之后的**下探 → 横向对齐 → 合爪**交给 π0.5。
+#: 由 `skills/pick_real/strategy.py::apply()` 按 `configs/strategies.json` 里那一行覆盖。
+#: 和环境变量 `PICK_VLA_END` 是两个岔口：那个在「下探到底」之后接，这个在**下探之前**接。
+VLA_END = ""
+
+
+def _descend_planned(arm, percep, center):
+    """竖直扎到底那一截：**终点按 `decide.plan` 现算**，扎完把实测偏差记进账本。
+
+    和直接调 `_descend_to_grasp` 的差别只有两处：
+      · 扎之前把 `gates.GRASP_Z_FINAL_REAL` 换成「默认值 + 上一趟实测超深」的补正量；
+      · 扎完读回 TCP，算这一趟实际比指令深/浅多少，记下来给下一趟用。
+
+    **`GRASP_Z_FINAL_REAL` 扎完要还原**：断点、面板显示、别的调用方读的都是策略表
+    那一份，这一趟的补正只对这一次下扎有效。
+    """
+    from . import decide, gates                                  # noqa: PLC0415
+
+    shape = type(getattr(percep, "shape", None)).__name__
+    p = decide.plan(shape)
+    keep = gates.GRASP_Z_FINAL_REAL
+    gates.GRASP_Z_FINAL_REAL = float(p["grasp_z_final_mm"]) / 1000.0
+    try:
+        ok, tcp = _descend_to_grasp(arm, center)
+    finally:
+        gates.GRASP_Z_FINAL_REAL = keep
+    z = float(np.asarray(tcp, dtype=np.float64).reshape(-1)[2])
+    off = (z - (float(center[2]) + float(p["grasp_z_final_mm"]) / 1000.0)) * 1000.0
+    decide.remember(shape, overshoot_mm=off)
+    print(f"    [现算] 下探终点 {float(p['grasp_z_final_mm']):+.1f}mm（{p['why']}）；"
+          f"实测停 {z * 1000:+.1f}mm，比指令 {off:+.1f}mm", flush=True)
+    return ok, tcp
+
+
+def _keep_near_anchor(c, tag: str):
+    """新认出来的中心离上一次的锚点太远 → 退回锚点。
+
+    方块只会被爪子碰动一点（2026-10-20 实测 8 趟，单趟最多 33.3mm），跳得远的那一眼
+    是认错了。锚点由重试策略写进 `knobs.ANCHOR_XY`；没锚点就原样返回。
+    """
+    if c is None or knobs.ANCHOR_XY is None:
+        return c
+    from ppo.guard import clamp_center                        # noqa: PLC0415
+
+    out, _d, _jumped = clamp_center(c, knobs.ANCHOR_XY, tag=tag)
+    return out
+
+
+def _snap_after_close(cams, verdict) -> None:
+    """合爪之后马上留一张原始帧（一个像素都不画），成败都留。
+
+    下探那一张（`JAW_RAW_IMG`）是合爪**前**的，看不出爪里到底有没有、正不正；这一张
+    才有那个信息，用来训「合爪后夹住没有」的判官。没相机就静默跳过。
+    """
+    if cams is None:
+        return
+    cam = _wrist(cams)
+    if cam is None:
+        return
+    try:
+        import json                                                   # noqa: PLC0415
+        import time                                                   # noqa: PLC0415
+        from pathlib import Path                                      # noqa: PLC0415
+
+        import cv2                                                    # noqa: PLC0415
+
+        rgb = np.asarray(cam.shot())
+        cv2.imwrite(str(knobs.JAW_AFTER_IMG),
+                    cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        # 判据跟图一起落盘：归档按它命名，不靠整集成败去猜。
+        Path(knobs.JAW_AFTER_JSON).write_text(
+            json.dumps({"verdict": str(verdict), "t": time.time()}),
+            encoding="utf-8")
+    except Exception as exc:                                          # noqa: BLE001
+        print(f"  [VLM·记] 合爪后那一帧没留下（{exc}）", flush=True)
+
+
 def _close_and_lift(arm, ctrl, cal, state, index, *, grasp_z, empty_deg, open_deg,
-                    center, hover, closing, percep=None) -> dict:
+                    center, hover, closing, percep=None, cams=None,
+                    already_closed: bool = False) -> dict:
     """微调过了 → 合爪 → 判夹住没有 → 抬升到搬运高度。
 
     **两条路共用这一份**：一种是这一趟从头走完的（`PickRealSkill.run`），一种是从断点
@@ -37,25 +119,41 @@ def _close_and_lift(arm, ctrl, cal, state, index, *, grasp_z, empty_deg, open_de
     `closing` 合爪轴、`grasp_z` 下探停在哪、`empty_deg`/`open_deg` 这一趟的夹爪行程两端。
     **行程两端带上、不在这儿重量** —— 这时候两个爪子正夹在方块两侧，合一次空爪就是拿
     爪去夹方块。
+
+    **`already_closed=True` 是 VLA 末端那一支进来的路**（`vla_end.run`）：爪子已经由
+    模型合上了，这里**不再合一次**（再合会把「基本没动」误判成扭矩没使能），直接判。
     """
     from grasp_check import GraspMonitor, classify_ref                   # noqa: PLC0415
     from servo_bridge import read_gripper_deg                            # noqa: PLC0415
 
     # ---- 6. 合爪：合到压不动，再拿角度判夹住没有 ----
+    # **合爪那一刻的位姿单独记一份**（下探到底之后还修过轴偏，`check` 记的那个数不是它）。
+    # 「失败那几趟差多少偏移」全靠这个数和方块中心算相对位姿。
+    try:
+        _tcp_close = [round(float(v) * 1000.0, 1)
+                      for v in np.asarray(arm.tcp(), dtype=np.float64).reshape(-1)[:3]]
+    except Exception:                                               # noqa: BLE001
+        _tcp_close = None
     state.seg = "合爪"
-    stop, info = _close_until_stall(arm, closing)
+    if already_closed:
+        stop, info = "vla", {"why": "VLA 末端已经合过爪", "steps": 0,
+                             "q0": float(arm.grip_q()), "q": float(arm.grip_q())}
+    else:
+        stop, info = _close_until_stall(arm, closing, empty_deg=empty_deg)
     grip_deg, _src = _gripper_deg(arm, ctrl)
     verdict = classify_ref(grip_deg, empty_deg, cal, open_deg)
     print(f"    合爪：{stop}（{info['why']}，{info['steps']} 步）"
           f"  开合角 {info['q0']:+.3f} → {info['q']:+.3f} rad"
           f"  6 号舵机 {grip_deg if grip_deg is None else f'{grip_deg:.1f}°'}（{_src}）"
           f"  → 判 {verdict}")
+    _snap_after_close(cams, verdict)
     if verdict != "held":
         # **光看角度分不清「夹空了」和「压根没动」—— 两者都停在基准附近。**
         # 分得开的是**开口变没变**：真合爪是「从张开一路合过来」，`q` 离 `q0` 很远；
         # 一动没动说明舵机收到目标位置没出力 —— 最常见是扭矩没使能（`real_home.py`：
         # 使能位断电才清，harness 自己不开）。这一条单独报出来，别让人去怀疑盒子。
-        didnt_move = abs(float(info["q"]) - float(info["q0"])) < 1e-6
+        didnt_move = (not already_closed
+                      and abs(float(info["q"]) - float(info["q0"])) < 1e-6)
         # 退回去的那一段顺手把爪张开（`grip=1.0`）—— 现在是半合着的，直接横着退，
         # 指垫会贴着盒子侧面一路刮过去。
         _goto(arm, hover, vmax=speed_vmax(SLOW), grip=1.0)
@@ -64,7 +162,7 @@ def _close_and_lift(arm, ctrl, cal, state, index, *, grasp_z, empty_deg, open_de
                f"没夹住（6 号舵机 {grip_deg}°，空抓基准 {empty_deg:.1f}°，判 {verdict}）")
         return {"ok": False, "why": why,
                 "close": info, "grip_deg": grip_deg, "empty_deg": empty_deg,
-                "verdict": verdict}
+                "verdict": verdict, "tcp_close_mm": _tcp_close}
 
     state.held = index
     state.grip_ref = float(arm.grip_q())
@@ -99,24 +197,13 @@ def _close_and_lift(arm, ctrl, cal, state, index, *, grasp_z, empty_deg, open_de
     # 「抬到多高」的事，跟「抓没抓住」是两件事。那一趟（`…/bi79lknh7.output` 第 382~388 行）
     # 6 号 46.6°、判 held、掉落判据 False，却被这一条判死。抬升走到哪照旧打在下面。
     ok = bool(end_verdict == "held" and not dropped)
-    # **关节回放的切点**（用户 2026-10-19）：抬升判完这一刻。回放走到这里先停下判
-    # 夹住没有，判不过就不往下放、退回正常逻辑（`real/joint_rec.py`）。
-    try:
-        from real import joint_rec as _jrec                        # noqa: PLC0415
-        _jrec.mark("lifted", grip_deg=end_deg, empty_deg=empty_deg,
-                   open_deg=open_deg, verdict=str(end_verdict), tcp_z=z_now,
-                   # 这一趟抓的是**哪个位置**的方块。回放只在这条记录的位置
-                   # 跟方块现在的位置对得上时才走（`panel/rig.py::_run_replay`）。
-                   center=[float(center[0]), float(center[1])])
-    except Exception:                                             # noqa: BLE001
-        pass
     if ok and up != "reached":
         print(f"    ⚠ 抓着没掉，但抬升只走到 {z_now * 1000:+.0f}mm（该到 "
               f"{LIFT_Z * 1000:+.0f}mm，停因 {up}）—— 这不算这一趟失败")
     out = {"ok": ok, "grasp_z": grasp_z, "grip_deg": end_deg,
            "empty_deg": empty_deg, "start_deg": mon.peak,
            "verdict": end_verdict, "dropped": dropped,
-           "lift": up, "tcp_z": z_now}
+           "lift": up, "tcp_z": z_now, "tcp_close_mm": _tcp_close}
     if not ok:
         out["why"] = (f"没夹住/掉了（6 号舵机 {end_deg}°，判 {end_verdict}，"
                       f"掉落判据 {dropped}；抬升停因 {up}）")
@@ -198,6 +285,15 @@ def _poke_check_after_descend(percep, text: str, center):
         print("    下探之后没认到方块 —— 戳没戳到这一眼判不了")
         return None, None
     c_after = np.asarray(c_after, dtype=np.float64).reshape(-1)
+    # **跳得太远就不是方块在动**（`ppo/guard.py`）：方块被爪子推一下最多挪几十毫米。
+    # 这一眼按认错处理，返回 `None` 让调用方沿用下探之前冻住的那个中心。
+    if knobs.ANCHOR_XY is not None:
+        from ppo.guard import clamp_center                    # noqa: PLC0415
+
+        c_after, _jump, jumped = clamp_center(c_after, knobs.ANCHOR_XY, tag="下探之后")
+        if jumped:
+            print("    · 这一眼不认，沿用下探之前冻住的那个中心")
+            return None, None
     d = (c_after[:2] - np.asarray(center, dtype=np.float64).reshape(-1)[:2])
     mm = float(np.linalg.norm(d)) * 1000.0
     print(f"    下探之后方块中心 {np.round(c_after * 1000, 1)}mm，"
@@ -315,7 +411,7 @@ class PickRealSkill(Skill):
             state.seg = "行程两端 → 合一次空爪、再张到底"
             before = read_gripper_deg(ctrl)
             empty_deg = measure_empty(ctrl)
-            open_deg = measure_open(ctrl)
+            open_deg = measure_open(ctrl, tick=arm.grip_open_tick)
             if empty_deg is None or open_deg is None:
                 return {"ok": False, "why": "6 号舵机读不到数，行程两端建不起来",
                         "give_up": True}
@@ -337,19 +433,6 @@ class PickRealSkill(Skill):
                   f" / 张到最大 "
                   f"{'没记下' if open_deg is None else f'{open_deg:.1f}°'}")
 
-        # ---- 0.2 「照上一趟的放置记录，直接去抓方块现在那一点」----
-        # 用户 2026-10-19：第 1 轮在 A 抓、放到 B；第 2 轮方块在 B。上一轮松爪那一刻
-        # 已经把「方块在哪、爪子当时怎么摆的」记在 `place_low` 切点里了（`place.py`），
-        # 照它摆回去就是同一套几何 —— 不看画面、不走整段回放。
-        if start_at == "place":
-            res = self._grasp_from_place(arm, cams, percep, state, index, ctrl, cal,
-                                         empty_deg, open_deg)
-            if res is not None:
-                return res
-            print("    ↻ 续跑入口「place」：盘上没有放置记录 —— 退成「对准」入口")
-            start_at = "align"
-            _raise_to_safe(arm)
-
         # ---- 0.5 起步前先把爪子合上 ----
         # `measure_open()` 是张到底量行程的那一下，量完爪子就停在**张着**的位置；
         # 第二次、第三次尝试则是上一趟留下的姿态（合爪到死、或者张开着退回来）。
@@ -368,6 +451,14 @@ class PickRealSkill(Skill):
             guess = np.asarray(knobs.REPLAY["guess"], dtype=np.float64)
             print(f"    回放：起搜中心用 {np.round(guess * 1000, 0)}mm"
                   f"（不按配置里的 {np.round(geom.real_pick_xy() * 1000, 0)}mm）")
+        elif knobs.GUESS_XY is not None:
+            # **目标就是上一趟放下的地方**（用户 2026-10-20）：面板在上一趟摆件成功之后
+            # 把落点写进 `knobs.GUESS_XY`。这里只拿它当起搜中心 —— 下面「初始位置先看
+            # 一眼」和进场之后那一量都照旧，画面说是哪儿就是哪儿。
+            guess = np.array([float(knobs.GUESS_XY[0]), float(knobs.GUESS_XY[1]),
+                              table_z + float(sh.rest_z)], dtype=np.float64)
+            print(f"    起搜中心用上一趟放下的位置 {np.round(guess[:2] * 1000, 0)}mm"
+                  f"（配置里写的是 {np.round(geom.real_pick_xy() * 1000, 0)}mm）")
         else:
             guess = np.array([*geom.real_pick_xy(), table_z + float(sh.rest_z)])
 
@@ -386,6 +477,7 @@ class PickRealSkill(Skill):
             print("    初始位置先看一眼（不动臂）：")
             c0, y0, f0 = _look(arm, cams, percep, text, guess)
             if c0 is not None and y0 is not None:
+                c0 = _keep_near_anchor(c0, "初始位置")
                 print(f"    ↻ 初始位置看得见：x={c0[0] * 1000:.0f} y={c0[1] * 1000:.0f}"
                       f" z={c0[2] * 1000:.0f}mm yaw {np.degrees(y0):+.1f}°"
                       f" → 进场点改用它（配置里写的是 "
@@ -394,11 +486,13 @@ class PickRealSkill(Skill):
             else:
                 print("    · 初始位置没认出来，照旧用配置里那个位置进场")
 
-        # ---- 1. 进场：到大致位置上方 80mm ----
+        # ---- 1. 进场：到大致位置上方 `HOVER_ABOVE_M`（默认 80mm）----
         state.seg = "进场 → 盒子大致位置上方"
-        out = _goto(arm, guess + np.array([0.0, 0.0, 0.08]), vmax=speed_vmax(SPEED))
+        _enter = guess + np.array([0.0, 0.0, float(knobs.HOVER_ABOVE_M)])
+        out, _enter = _goto_reach(arm, _enter, vmax=speed_vmax(SPEED),
+                                  floor_z=float(guess[2]) + APPROACH_MIN_ABOVE_M)
         print(f"    进场：{out}  TCP {np.round(arm.tcp(), 3)}"
-              f"（该到 {np.round(guess + [0, 0, 0.08], 3)}）")
+              f"（该到 {np.round(_enter, 3)}）")
         if out == "term" or getattr(arm, "terminated", False):
             # `_goto` 现在只交 "reached"/"stall"，停手要看 `terminated`（用户 2026-10-18）。
             return {"ok": False, "why": "停手", "give_up": True}
@@ -434,6 +528,7 @@ class PickRealSkill(Skill):
             why = facts.get("no_world_why") or facts.get("why") or "没认出来"
             print(f"    ✗ {why}")
             return {"ok": False, "why": f"找不着（{why}）", "give_up": True}
+        center = _keep_near_anchor(center, "进场之后")
         print(f"    量出来：x={center[0] * 1000:.0f} y={center[1] * 1000:.0f}"
               f" z={center[2] * 1000:.0f}mm  yaw {np.degrees(yaw):+.1f}°"
               f"（起搜中心 {np.round(guess * 1000, 0)}mm，挪了 "
@@ -464,7 +559,7 @@ class PickRealSkill(Skill):
         # 进场是照配置那个坐标走的，盒子偏了就不在正上方了。不纠的话下探那一段
         # 就从「只剩纯下降」变成「一边横移一边下降」，横移是贴着盒顶扫过去的。
         state.seg = "挪到盒子正上方"
-        hover = center + np.array([0.0, 0.0, 0.08])
+        hover = center + np.array([0.0, 0.0, float(knobs.HOVER_ABOVE_M)])
         # **先垂直、正上方，再转腕**（用户 2026-10-18）。转正那一步是绕工具轴拧 5 号：
         # 工具轴歪着的时候，两爪是在一个斜锥面上扫过去的 —— 实测进场这个姿态工具轴离
         # 垂直 43.8°，在它上面拧 65° 等于让两爪横扫一大圈。先把这个姿态摆成爪尖朝下
@@ -479,7 +574,9 @@ class PickRealSkill(Skill):
         # 位置那 3.6mm 由 `_goto` 的第二趟补；姿态这一趟只在这里要求，别处照旧。
         # **多给几趟**（用户 2026-10-18：「垂直到目标正上方」）：默认 3 趟上一趟差 5.1mm
         # 就收在 `stall`，那 5mm 让后面微调从偏心起手。5 趟到得了就到，到不了照样往下走。
-        out = _goto(arm, hover, vmax=speed_vmax(SPEED), quat=q_down, ow=0.2, tries=5)
+        out, hover = _goto_reach(arm, hover, vmax=speed_vmax(SPEED), quat=q_down,
+                                 ow=0.2, tries=5,
+                                 floor_z=float(center[2]) + APPROACH_MIN_ABOVE_M)
         print(f"    纠位：{out}  TCP {np.round(arm.tcp(), 3)}"
               f"（该到 {np.round(hover, 3)}），爪尖离垂直 "
               f"{_vertical(arm.quat())[1]:.1f}°")
@@ -515,19 +612,7 @@ class PickRealSkill(Skill):
         # **旋转对称的形状（圆柱/杯子）模型那条恒为 0**（`normal` 直接回当前开合轴）——
         # 那就不问模型、改问画面（红区剪影的边）。`use_px` 那条只在形状对称时才走。
         _sym = getattr(sh, "yaw_period_deg", 1.0) is None
-        # **换抓取方向**（用户 2026-10-19）：把选面的参考轴绕竖直轴转一个角度，让腕子
-        # 去对另一对侧面。0 = 现状；90 = 另一对。只有两对跨度相同（正方体）才真的会换 ——
-        # 长方体由形状按小跨度定，转了也还是那一对。
-        _side_deg = _grasp_side_deg()
-        _ref = np.asarray(arm.tool_x(), dtype=np.float64).reshape(-1)
-        if abs(_side_deg) > 1e-6:
-            _c, _s = np.cos(np.radians(_side_deg)), np.sin(np.radians(_side_deg))
-            _ref = np.array([_c * _ref[0] - _s * _ref[1],
-                             _s * _ref[0] + _c * _ref[1],
-                             float(_ref[2]) if _ref.size > 2 else 0.0],
-                            dtype=np.float64)
-            print(f"    抓取方向：参考轴转 {_side_deg:+.0f}°（去对另一对侧面）")
-        closing = np.asarray(sh.normal(yaw, _ref), dtype=np.float64)
+        closing = np.asarray(sh.normal(yaw, arm.tool_x()), dtype=np.float64)
         state.seg = "腕子对上方块侧面"
         steps, left = _align(arm, closing, cam=_wrist(cams), percep=percep, use_px=_sym)
         # 转完把 `closing` 跟到新朝向（圆柱的 `normal` 就是当前开合轴）。不跟的话
@@ -611,6 +696,27 @@ class PickRealSkill(Skill):
               f" + 余量 {z_margin * 1000:.1f}mm = max({GRASP_Z_MARGIN_REAL * 1000:.0f}mm,"
               f" 半高 {rest_z * 1000:.1f} + {GRASP_Z_OVER_TOP_REAL * 1000:.0f}mm)）")
         entry = np.array([aim[0], aim[1], float(center[2]) + 0.05])
+        # **末端交给 VLA 的第二个岔口**（2026-10-25，策略表里的 `vla_end`）。进到这里
+        # 脚本已经做完「认方块 → 搬过去 → 腕子对上方块侧面」，落点 `aim` 也算好了；
+        # 从这儿到合上爪原来是 下探（`_descend`）→ 横向对齐（`_set_clearance`）→
+        # 合爪（`_close_until_stall`）三件事，现在一起交给策略服务。夹没夹住仍然由
+        # `_close_and_lift(already_closed=True)` 判 —— 模型只出动作，不出判据。
+        # 走完（或走不成）都不再回头走脚本那三段，避免一趟里合两次爪。
+        if VLA_END == "after_align":
+            from . import vla_end                                  # noqa: PLC0415
+
+            r = vla_end.run(arm, cams, prompt=text, empty_deg=empty_deg,
+                            open_deg=open_deg, cal=cal)
+            if not r.get("ok"):
+                _goto(arm, hover, vmax=speed_vmax(SLOW), grip=1.0)
+                print(f"    ✗ VLA 末端没走成（{r.get('why')}）：这一趟不合爪，退回去")
+                return {"ok": False, "why": f"VLA 末端没走成（{r.get('why')}）",
+                        "vla": r}
+            return _close_and_lift(arm, ctrl, cal, state, index,
+                                   grasp_z=grasp_z, empty_deg=empty_deg,
+                                   open_deg=open_deg, center=center, hover=hover,
+                                   closing=closing, percep=percep, cams=cams,
+                                   already_closed=True)
         #
         # **下探这一段不走笛卡尔那条路。** 那一条是「走一小步、读一次、重解一次」，
         # 实测在真机上一边降一边被带偏（`out/run_real_18.log`：指令 x 恒定 0.239，
@@ -643,6 +749,25 @@ class PickRealSkill(Skill):
         # 段名要在**进微调之前**换成「合爪前微调」：面板的「从断点继续」靠它认入口
         # （`panel/rig.py::resume_stage`）。停在「下探到盒子」那一句上会被当成还没微调。
         state.seg = "合爪前微调"
+        # **VLA 末端接手的岔口**（2026-10-23，`PICK_VLA_END=1` 才走）。进来这一刻：
+        # 臂在下探到底、6 号舵机张到最大 —— 正是 `_build_endseg.py` 切的那一帧。
+        # 后面「横向纠偏 → 最后竖直一截 → 合爪」三件事交给策略服务；夹没夹住仍然由
+        # `_close_and_lift(already_closed=True)` 判。
+        if _vla_end_on():
+            from . import vla_end                                  # noqa: PLC0415
+
+            r = vla_end.run(arm, cams, prompt=text, empty_deg=empty_deg,
+                            open_deg=open_deg, cal=cal)
+            if not r.get("ok"):
+                _goto(arm, hover, vmax=speed_vmax(SLOW), grip=1.0)
+                print(f"    ✗ VLA 末端没走成（{r.get('why')}）：这一趟不合爪，退回去")
+                return {"ok": False, "why": f"VLA 末端没走成（{r.get('why')}）",
+                        "vla": r}
+            return _close_and_lift(arm, ctrl, cal, state, index,
+                                   grasp_z=grasp_z, empty_deg=empty_deg,
+                                   open_deg=open_deg, center=center, hover=hover,
+                                   closing=closing, percep=percep, cams=cams,
+                                   already_closed=True)
         check = _set_clearance(arm, cams, percep, center, "下探到底（合爪前）",
                                instruction=text, clear=clear,
                                # 微调过了之后那几段还要用的东西，一起写进断点
@@ -685,8 +810,11 @@ class PickRealSkill(Skill):
         # 放在微调后面是有意的：微调全程 z 钉死、只挪水平，扎下去之后就没法再横着调了。
         # 下探终点原来只到「中心 + 25mm」，爪尖停在方块顶面上方 —— `out/run_real_74.log`
         # 就是在这儿空抓的。这一截只降 z，走完才合爪。
+        # **下探之前留一张原始帧**：VLM 在下探之后要判「方块还在不在两爪之间」，
+        # 靠的是「下扎前后哪儿变了」。没装 VLM 时这一步直接返回 None、不写盘。
+        pre_img = _vlm_gate.save_pre_descend(cams)
         state.seg = "合爪前竖直下探"
-        ok_d, tcp_d = _descend_to_grasp(arm, center)
+        ok_d, tcp_d = _descend_planned(arm, percep, center)
         hit = _stopped(arm)
         if hit is not None:
             return hit
@@ -699,6 +827,35 @@ class PickRealSkill(Skill):
         # **方块被推走了就按这一眼的中心修轴偏**（2026-10-18）：`_set_clearance` 里
         # 3D 那条尺子用的是传进去的 `center`；拿旧中心等于对着一块空桌面纠轴偏。
         center_now = center if box_now is None else box_now
+        # **VLM 在下探之后看一眼**（2026-10-23 用户定）：现量一次离轴，再问它
+        # 「方块还在两爪之间吗」。判「不在」只做一件事 —— 抬回悬停点重下一次；
+        # 不改档、不改旋钮、不外溢到下一集。一集仍然只合一趟爪。
+        jg = _vlm_gate.check(arm, cams, percep, tag="下探之后（只修轴偏）",
+                             pre_img=pre_img, center=center_now)
+        if jg.get("veto"):
+            print("    ⟲ VLM 判「方块不在两爪之间」—— 抬回悬停点、重下一次"
+                  "（这一集仍然只合一趟爪）", flush=True)
+            _goto(arm, hover, vmax=speed_vmax(SLOW), grip=1.0)
+            hit = _stopped(arm)
+            if hit is not None:
+                return hit
+            state.seg = "VLM 否决后重下"
+            _shift2, box_now2 = _poke_check_after_descend(percep, text, center_now)
+            if box_now2 is not None:
+                center_now = box_now2
+                box_now = box_now2          # 交回策略的「下探之后方块在哪」用最后一次
+            ok_d, tcp_d = _descend_planned(arm, percep, center_now)
+            hit = _stopped(arm)
+            if hit is not None:
+                return hit
+            if not ok_d:
+                _goto(arm, hover, vmax=speed_vmax(SLOW), grip=1.0)
+                print("    ✗ VLM 否决重下之后还是没走成：这一趟不合爪，退回去")
+                return {"ok": False, "why": "VLM 否决重下之后没到底"}
+            # 重下之后再量一次离轴（只量、不再问、不再否决）—— 这是数据里那对
+            # 「重下前后」的第二个数。
+            _vlm_gate.check(arm, cams, percep, tag="VLM 否决后重下（只量）",
+                            ask=False, center=center_now)
         # **下探之后再修一次轴偏**（用户 2026-10-16：「下探以后再加一个微调，但是只能动
         # 轴偏方向，其他方向不能动」）。竖直那一截把相机跟着带下去了一截，画面里量出来的
         # 轴偏跟在上面那一档量的不是同一个数 —— 所以要在这个高度上再对一次。**只走轴偏
@@ -719,81 +876,13 @@ class PickRealSkill(Skill):
         res = _close_and_lift(arm, ctrl, cal, state, index, grasp_z=float(tcp_d[2]),
                               empty_deg=empty_deg, open_deg=open_deg,
                               center=center, hover=hover, closing=closing,
-                              percep=percep)
+                              percep=percep, cams=cams)
         res["box_shift_mm"] = box_shift_mm
-        return res
-
-    def _grasp_from_place(self, arm, cams, percep, state, index, ctrl, cal,
-                          empty_deg, open_deg) -> dict | None:
-        """**照上一趟的放置记录，直接去抓方块现在躺的那一点**（用户 2026-10-19）。
-
-        第 1 轮在 A 抓、放到 B；第 2 轮方块在 B。上一轮松爪那一刻 `place_low` 记了
-        五样：TCP 在哪、两爪中点（= 方块中心）在哪、腕子朝向、合爪时的 TCP 高度、
-        方块半边长。方块垂直落下去，水平位置不跟着变 —— 把 TCP 摆回松爪那两个坐标、
-        降到与方块中心同样的高度差，再竖直下去，就是抓它时同一套几何。
-
-        **不看画面、不走整段回放**：这一步要的就是「换了个位置照样会抓」。
-        盘上没有放置记录（旧记录）时返回 None，调用方退成「对准」入口。
-        """
-        from real import joint_rec                                   # noqa: PLC0415
-
-        rec = joint_rec.load()
-        marks = (rec or {}).get("meta", {}).get("marks") or []
-        low = next((m for m in marks if m.get("name") == "place_low"), None)
-        if low is None:
-            return None
-        try:
-            tcp0 = np.asarray(low.get("tcp"), dtype=np.float64).reshape(-1)
-            gap = np.asarray(low.get("gap_center"), dtype=np.float64).reshape(-1)
-            quat = np.asarray(low.get("quat"), dtype=np.float64).reshape(-1)
-            tool_x = _h(np.asarray(low.get("tool_x"), dtype=np.float64).reshape(-1))
-            half = float(low.get("half"))
-            gz = float(low.get("grasp_z"))
-            pc = float(low.get("pick_center_z"))
-            table = float(low.get("table_z"))
-        except (TypeError, ValueError):
-            print("    ↻ 续跑入口「place」：放置记录字段读不出来（旧记录）")
-            return None
-        if tcp0.size < 3 or gap.size < 2 or quat.size < 4 or half <= 0.0:
-            print("    ↻ 续跑入口「place」：放置记录字段不全（旧记录）")
-            return None
-
-        # 方块落到桌上之后中心高度 = 桌面 + 半边长；TCP 相对中心的那个高度差沿用
-        # 抓它那一趟（`grasp_z - pick_center_z`）。不另猜一个数。
-        z_grasp = (table + half) + (gz - pc)
-        print(f"    ↻ 续跑入口「place」：上一趟把方块放在 ({gap[0] * 1000:.0f}, "
-              f"{gap[1] * 1000:.0f})mm（松爪 TCP ({tcp0[0] * 1000:.0f}, "
-              f"{tcp0[1] * 1000:.0f}, {tcp0[2] * 1000:.0f})mm）—— 照这条记录摆回去；"
-              f"合爪 TCP z 取 {z_grasp * 1000:+.1f}mm")
-
-        hover = np.array([tcp0[0], tcp0[1], LIFT_Z], dtype=np.float64)
-        state.seg = "续跑·放置点：摆到方块上方"
-        out = _goto(arm, hover, vmax=speed_vmax(SPEED), grip=1.0,
-                    quat=quat, ow=0.2, tries=5)
-        print(f"    摆过去：{out}  TCP {np.round(arm.tcp(), 3)}"
-              f"（该到 {np.round(hover, 3)}）")
-        hit = _stopped(arm)
-        if hit is not None:
-            return hit
-
-        state.seg = "续跑·放置点：竖直下探"
-        out, tcp = _descend(arm, np.array([tcp0[0], tcp0[1]], dtype=np.float64),
-                            float(hover[2]), float(z_grasp), closing=tool_x,
-                            open_at=0.5)
-        tcp = np.asarray(tcp, dtype=np.float64).reshape(-1)
-        print(f"    下探：{out}  TCP z={float(tcp[2]) * 1000:+.1f}mm"
-              f"（该到 {z_grasp * 1000:+.1f}mm）")
-        hit = _stopped(arm)
-        if hit is not None:
-            return hit
-
-        center = np.array([float(gap[0]), float(gap[1]), float(table + half)],
-                          dtype=np.float64)
-        res = _close_and_lift(arm, ctrl, cal, state, index,
-                              grasp_z=float(tcp[2]), empty_deg=empty_deg,
-                              open_deg=open_deg, center=center, hover=hover,
-                              closing=tool_x, percep=percep)
-        res["from_place"] = True
+        # **交回实测**（`ppo/policy.py` 用）：这一趟对着哪个中心下的爪、下探之后方块在
+        # 哪儿。重试策略拿后一个当下一趟的定位锚点。
+        res["center_before"] = [float(center[0]), float(center[1]), float(center[2])]
+        res["box_center_after"] = (None if box_now is None else
+                                   [float(box_now[0]), float(box_now[1]), float(box_now[2])])
         return res
 
     def _resume_pick(self, arm, cams, percep, state, index, ctrl, cal, ck: dict,
@@ -825,7 +914,7 @@ class PickRealSkill(Skill):
             # 直接竖直下探一截再合爪 —— 用户 2026-10-18「微调后就下探」。
             state.seg = "从断点接上 → 下探一截并合爪"
             print("    续跑入口 close：微调已判过，跳过微调，直接竖直下探一截再合爪")
-            ok_d, tcp_d = _descend_to_grasp(arm, center)
+            ok_d, tcp_d = _descend_planned(arm, percep, center)
             hit = _stopped(arm)
             if hit is not None:
                 return hit
@@ -838,8 +927,12 @@ class PickRealSkill(Skill):
                                   grasp_z=float(tcp_d[2]),
                                   empty_deg=float(empty_deg), open_deg=float(open_deg),
                                   center=center, hover=hover, closing=closing,
-                                  percep=percep)
+                                  percep=percep, cams=cams)
             res["box_shift_mm"] = box_shift_mm
+            res["center_before"] = [float(center[0]), float(center[1]), float(center[2])]
+            res["box_center_after"] = (None if _box_now is None else
+                                       [float(_box_now[0]), float(_box_now[1]),
+                                        float(_box_now[2])])
             return res
         if bool(ck.get("axis_only")):
             # **断点是在「下探之后那趟只修轴偏」里停的**：竖直那一截上一趟已经走过了
@@ -862,7 +955,7 @@ class PickRealSkill(Skill):
                                    grasp_z=float(tcp_d[2]),
                                    empty_deg=float(empty_deg), open_deg=float(open_deg),
                                    center=center, hover=hover, closing=closing,
-                                   percep=percep)
+                                   percep=percep, cams=cams)
         state.seg = "从断点接上 → 合爪前微调"
         check = _set_clearance(arm, cams, percep, center,
                                ck.get("tag") or "下探到底（合爪前）",
@@ -876,7 +969,7 @@ class PickRealSkill(Skill):
                     "clear": {k: v for k, v in check.items() if k != "near_uv"}}
         # 断点接上这条也一样：进带了再往下扎那一截（跟 `run` 那条同一个道理）。
         state.seg = "合爪前竖直下探"
-        ok_d, tcp_d = _descend_to_grasp(arm, center)
+        ok_d, tcp_d = _descend_planned(arm, percep, center)
         hit = _stopped(arm)
         if hit is not None:
             return hit
@@ -889,6 +982,10 @@ class PickRealSkill(Skill):
         res = _close_and_lift(arm, ctrl, cal, state, index, grasp_z=float(tcp_d[2]),
                               empty_deg=float(empty_deg), open_deg=float(open_deg),
                               center=center, hover=hover, closing=closing,
-                              percep=percep)
+                              percep=percep, cams=cams)
         res["box_shift_mm"] = box_shift_mm
+        res["center_before"] = [float(center[0]), float(center[1]), float(center[2])]
+        res["box_center_after"] = (None if _box_now is None else
+                                   [float(_box_now[0]), float(_box_now[1]),
+                                    float(_box_now[2])])
         return res

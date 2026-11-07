@@ -10,9 +10,9 @@ from core.params import (ALIGN_CHUNK, ALIGN_MAX_STEPS,            # noqa: E402
                          SLOW, SPEED, STUCK_TOL,
                          acc_amax, speed_vmax)
 import numpy as np
-from .knobs import ALIGN_MAX_MOVES, ALIGN_PROBE_DEG, AXIS_TOL_PX, CLEAR_3D_ENFORCE, CLEAR_3D_TOL_MM, CLEAR_AXIS_AMP_MAX_MM, CLEAR_AXIS_BACK, CLEAR_AXIS_FAR, CLEAR_BAND_HI_PX, CLEAR_BAND_LO_PX, CLEAR_BAND_ON, CLEAR_CONTACT_GAIN, CLEAR_FLAT_STOP, CLEAR_GAIN, CLEAR_MIN_DEG_GAIN_MAX, CLEAR_MIN_JOINT_DEG, CLEAR_MIN_STEP_M, CLEAR_STEP_DZ_M, CLEAR_STEP_M, CLEAR_TARGET_PX, CLEAR_Z_KEEP_M, CLEAR_Z_RECOVER_M, CLEAR_Z_RECOVER_MIN, CLEAR_Z_FLOOR_M, FREE_DESCENT, MANUAL_CMD, MANUAL_GOTO_TOL, MANUAL_MAX_MOVES, MANUAL_WAIT_S, SKIP_CLEARANCE_REAL, _ax_free, _gap_free
+from .knobs import ALIGN_MAX_MOVES, ALIGN_PROBE_DEG, CLEAR_MAX_MOVES, AXIS_TOL_PX, CLEAR_3D_ENFORCE, CLEAR_3D_TOL_MM, CLEAR_AXIS_AMP_MAX_MM, CLEAR_AXIS_BACK, CLEAR_AXIS_FAR, CLEAR_BAND_HI_PX, CLEAR_BAND_LO_PX, CLEAR_BAND_ON, CLEAR_CONTACT_GAIN, CLEAR_FLAT_STOP, CLEAR_FP_GAP_HI_MM, CLEAR_FP_GAP_LO_MM, CLEAR_GAIN, CLEAR_MIN_DEG_GAIN_MAX, CLEAR_MIN_JOINT_DEG, CLEAR_MIN_STEP_M, CLEAR_STEP_DZ_M, CLEAR_STEP_M, CLEAR_TARGET_PX, CLEAR_Z_KEEP_M, CLEAR_Z_RECOVER_M, CLEAR_Z_RECOVER_MIN, CLEAR_Z_FLOOR_M, FREE_DESCENT, MANUAL_CMD, MANUAL_GOTO_TOL, MANUAL_MAX_MOVES, MANUAL_WAIT_S, _ax_free, _gap_free
 from .pose import _align_deg, _px_per_mm, _wrist
-from .rulers import _box_deg_px, _box_half_m, _gap_leaving, _gap_need_px, _gap_ok, _gap_px, _gap_want_px, _jaw_check, _jaw_check_3d, _jaw_mm
+from .rulers import _box_deg_px, _box_half_m, _gap_leaving, _gap_need_px, _gap_ok, _gap_px, _gap_want_px, _jaw_check, _jaw_check_3d, _jaw_mm, _target_at_tip
 from .gates import _confirm_on, _confirm_pass, _confirm_step, _confirm_step_on, _drop_checkpoint, _manual_on, _peek_cmd, _publish, _save_checkpoint, _wait_cmd
 from .jac import dq_for as _jac_dq, probe as _jac_probe
 from .motion import _free_for, _goto, _joint_dir_xy, _step_min_deg, _wrist_turn
@@ -136,11 +136,6 @@ def _set_clearance(arm, cams, percep, center, tag: str, *, instruction=None,
     这时候**只修轴偏**（`|axis| <= AXIS_TOL_PX`），缝那条不当门槛、沿合爪轴那一段一律写 0
     —— 在这个高度上沿合爪轴挪就是拿爪面去怼方块。缝照样量、照样打，只是不拦门。
     """
-    # **微调整段跳过**（用户 2026-10-19：就要 `_oneshot_grasp.py` 那两趟的结果）。
-    # 加在这里而不是各个调用点：合爪前、下探之后那两趟都走这个函数，一个口子管住全部。
-    if SKIP_CLEARANCE_REAL:
-        print(f"    跳过微调「{tag}」：水平不动，直接往下扎")
-        return {"ok": True}
     try:
         return _clearance_loop(arm, cams, percep, center, tag, instruction=instruction,
                                guess=guess, clear=clear, resume=resume, ctx=ctx,
@@ -222,6 +217,12 @@ def _clearance_loop(arm, cams, percep, center, tag, *, instruction=None, guess=N
         if getattr(arm, "terminated", False):
             print("    ✗ 停手了 —— 微调不再往下走（断点留在盘上）")
             return {**last, "ok": False, "why": "停手", "give_up": True}
+        # **走满就收工**（2026-10-21）：这个循环原来没有次数上限，判据一直不过就一直挪
+        # （实测有一趟走到第 63 次）。阈值见 `knobs.CLEAR_MAX_MOVES` 的注释。
+        if n >= CLEAR_MAX_MOVES:
+            print(f"    ✗ 微调走满 {CLEAR_MAX_MOVES} 步还没进带里 —— 这一趟不合爪，退回去")
+            return {**last, "ok": False, "why": f"微调走满 {CLEAR_MAX_MOVES} 步",
+                    "tries": n}
         sub = tag if n == 0 else f"{tag}（微调第 {n} 次后）"
         # **只修轴偏那一趟：缝那条不拦门**（用户 2026-10-16：「只能动轴偏方向」、2026-10-17
         # 「下探后的微调无需调整缝隙」）。这一半现在由 `_jaw_check` 自己按 `axis_only` 判 ——
@@ -240,47 +241,50 @@ def _clearance_loop(arm, cams, percep, center, tag, *, instruction=None, guess=N
                 print(f"    ✗ 量不了：{mm.get('why')} —— 这一趟不合爪，退回去")
                 return {**last, **mm, "ok": False, "why": mm.get("why"), "tries": n,
                         "pixel": False}
-            # **`axis_only` 那一趟只拿离轴那条拦门**（跟画面那一支同一个口径：这一趟沿轴
-            # 不动，沿轴差多少都拦不住、也不该拦）。
-            _off_ok = bool(abs(float(mm["p"])) <= CLEAR_3D_TOL_MM / 1000.0)
-            # **画面那条轴偏也得过**（用户 2026-10-18：「轴偏不过肯定抓不到」）。
-            # 3D 那条容 5mm、画面那条容 35 像素（≈3mm）—— 实测同一眼能出现 3D 报
-            # +4.7mm「过」、画面报 −53 像素「不过」，然后合爪抓空。两条各用各的容，
-            # **都过才算过**；画面量不出来（`axis is None`）才只认 3D 那条。
+            # **`full` 这一档只认新的那条几何**（用户 2026-10-20：「旧的都不用了，用我说的
+            # 新的轴，以及预估的等高度的范围来判断」）：
+            #   · 合爪轴 = FK 从**固定爪尖**出发、沿固定爪→动爪的水平**射线**，高度就是
+            #     爪尖高度（`_target_at_tip` 的 `u` / `z_tip`）；
+            #   · 目标 = `percep` 估出来的**占地范围**，抬到同一高度（同一个函数）。
+            # 拦门两条：射线**穿过**那个范围；爪尖到范围**近面**的缝落在毫米带里。
+            # 画面那两条（描死的轴、可见红区）只报数，不再决定走不走。
+            fp = _target_at_tip(arm, percep)
+            if fp is None:
+                print("    ✗ 量不了：占地范围估不出来（这一眼没有世界坐标 / 尺寸）"
+                      "—— 这一趟不合爪，退回去")
+                return {**last, "ok": False, "why": "占地范围估不出来",
+                        "tries": n, "pixel": False}
+            _off_ok = bool(abs(float(mm["p"])) <= CLEAR_3D_TOL_MM / 1000.0)  # 只报数
             _axis_px = last.get("axis")
-            _axis_px_ok = bool(_axis_px is None
-                               or abs(float(_axis_px)) <= AXIS_TOL_PX)
-            # **缝那一半用画面那条带**（用户 2026-10-17：「新版离轴+旧版的缝」、
-            # 「缝是 20~75 像素」）：`CLEAR_BAND_LO_PX <= gap <= CLEAR_BAND_HI_PX`。
-            # 3D 的「沿轴」那维照量照打、不在这里拦门。
             _gap_px = last.get("gap")
             _gap_ok = bool(_gap_px is not None
                            and CLEAR_BAND_LO_PX <= float(_gap_px) <= CLEAR_BAND_HI_PX)
-            # 缝那一维已经放弃（连着打转）→ 只看离轴，同 `axis_only`。
-            mm_ok = bool(_off_ok and _axis_px_ok
-                         and (True if (axis_only or skip_gap) else _gap_ok))
-            if _off_ok and not _axis_px_ok:
-                print(f"    ⚠ 3D 离轴在容里（{mm['p'] * 1000:+.1f}mm / 容 "
-                      f"{CLEAR_3D_TOL_MM:.0f}mm），画面那条不过（轴偏 "
-                      f"{float(_axis_px):+.0f} 像素 / 容 {AXIS_TOL_PX:.0f}）—— "
-                      f"按不过算，接着纠")
+            _fp_gap_ok = bool(CLEAR_FP_GAP_LO_MM <= float(fp["gap_mm"])
+                              <= CLEAR_FP_GAP_HI_MM)
+            # 缝那一维已经放弃（连着打转）→ 只看射线穿没穿过范围，同 `axis_only`。
+            mm_ok = bool(fp["crosses"]
+                         and (True if (axis_only or skip_gap) else _fp_gap_ok))
+            _px_txt = ("画面轴偏 —" if _axis_px is None
+                       else f"画面轴偏 {float(_axis_px):+.0f}px（旧，只报数）")
+            print(f"    ⟲ 新尺子：射线{'穿过' if fp['crosses'] else '**没穿过**'}"
+                  f"占地范围（离轴 {fp['p_mm']:+.1f}mm / 跨过 ±{fp['hn_mm']:.1f}；"
+                  f"沿轴 {fp['s_mm']:+.1f} ± {fp['hu_mm']:.1f}；"
+                  f"爪尖到近面 {fp['gap_mm']:+.1f}mm / 要落在 "
+                  f"[{CLEAR_FP_GAP_LO_MM:.1f}, {CLEAR_FP_GAP_HI_MM:.1f}] 里）；"
+                  f"{_px_txt}")
             if mm_ok:
                 if axis_only or skip_gap:
                     _only_txt = ("这一趟只修轴偏" if axis_only
                                  else "缝那一维连着打转、已放弃，只修轴偏")
-                    print(f"    ✓ 离轴进容里了（离轴 {mm['p'] * 1000:+.1f}mm / 容 "
-                          f"{CLEAR_3D_TOL_MM:.0f}mm；画面那条 "
-                          + ("—（量不出来，只认 3D）" if _axis_px is None
-                             else f"{float(_axis_px):+.0f} 像素 / 容 {AXIS_TOL_PX:.0f}")
-                          + f"；{_only_txt}，沿轴差 "
-                          f"{mm['ds'] * 1000:+.1f}mm 只报数）—— 合爪")
+                    print(f"    ✓ 射线穿过占地范围（离轴 {fp['p_mm']:+.1f}mm / "
+                          f"跨过 ±{fp['hn_mm']:.1f}；{_only_txt}，爪尖到近面 "
+                          f"{fp['gap_mm']:+.1f}mm、沿轴差 {mm['ds'] * 1000:+.1f}mm "
+                          f"只报数）—— 合爪")
                 else:
-                    print(f"    ✓ 离轴和缝都过（离轴 {mm['p'] * 1000:+.1f}mm / 容 "
-                          f"{CLEAR_3D_TOL_MM:.0f}mm；画面轴偏 "
-                          + ("—" if _axis_px is None else f"{float(_axis_px):+.0f}")
-                          + f" 像素 / 容 {AXIS_TOL_PX:.0f}；缝 {float(_gap_px):+.0f} 像素 / "
-                          f"要落在 [{CLEAR_BAND_LO_PX:.0f}, {CLEAR_BAND_HI_PX:.0f}] 里）"
-                          f"—— 合爪")
+                    print(f"    ✓ 射线穿过占地范围、缝在带里（离轴 {fp['p_mm']:+.1f}mm / "
+                          f"跨过 ±{fp['hn_mm']:.1f}；爪尖到近面 {fp['gap_mm']:+.1f}mm / "
+                          f"要落在 [{CLEAR_FP_GAP_LO_MM:.1f}, "
+                          f"{CLEAR_FP_GAP_HI_MM:.1f}] 里）—— 合爪")
                 # **`ok` 必须显式覆盖**：`last`（画面那条）这一刻多半是 False（红区被爪子
                 # 挡着，缝过不了门槛），拦门的换成毫米那条之后它不再代表这一趟的结论。
                 # **判过了这一跳也写断点，而且无条件写**（用户 2026-10-15 要求：不许有
@@ -350,18 +354,15 @@ def _clearance_loop(arm, cams, percep, center, tag, *, instruction=None, guess=N
             # 两维混成一步是走不动的。
             _u3 = np.asarray(mm["u"], dtype=np.float64).reshape(-1)[:2]
             _n3 = np.asarray(mm["n"], dtype=np.float64).reshape(-1)[:2]
-            # 缝进没进带。拦门的就是画面那条带（`_gap_ok` 在上面算过）。
-            _gap_in = bool(_gap_ok)
-            # **缝没有读数就不许造缝**（用户 2026-10-18：「微调舵机完全用错了，没有起到
-            # 效果」）。`gap is None` 的意思是**合爪轴整条没穿过方块**（日志原文：「方块
-            # 横跨 −216~−78 像素，合爪轴在 0 那一条」）—— 臂在方块侧面十几毫米外。这一刻
-            # 3D 的「沿轴差」是拿一条不穿过方块的轴投影出来的，数看着在容里（±几毫米），
-            # 按它往 −u 推，就是推着臂远离方块：2026-10-18 那趟离轴 9.0 → 12.6 → 16.6 →
-            # 21.5 → 23.8 → 27.1mm，八步全白走。造缝这一维**只有画面给得回读数**
-            # （`_gap_ok`），给不出来就先拿离轴那条把轴对上。
-            if _gap_px is None and not (axis_only or skip_gap):
+            # 缝进没进带。拦门的就是上面那条**毫米**带（爪尖 ↔ 占地范围近面）。
+            _gap_in = bool(_fp_gap_ok)
+            # **射线没穿过范围就不许沿着它造缝**（用户 2026-10-18 那堂课：拿一条不穿过
+            # 方块的轴算「沿轴差」，按它推就是推着臂远离方块）。现在这条判据也换了源：
+            # 不再看画面量不量得出红区，而是看 `_target_at_tip` 的射线穿不穿过范围。
+            # 画面读不读得到都无所谓 —— 沿轴那一步的方向有 3D 的 `ds` 兜底。
+            if (not fp["crosses"]) and not (axis_only or skip_gap):
                 _gap_in = True
-                print("    ⚠ 画面量不出缝（合爪轴没穿过方块）—— 这一维没有读数，"
+                print("    ⚠ 射线没穿过占地范围 —— 这一维没有读数，"
                       "不做「造缝」，先拿离轴那条把轴对上")
             if axis_only or skip_gap or _gap_in:
                 # 缝已经在带里（或这一趟压根不许碰沿轴、或缝那维已经放弃）→
@@ -725,11 +726,15 @@ def _clearance_loop(arm, cams, percep, center, tag, *, instruction=None, guess=N
         _dq = None if _dp_px is None else _jac_dq(J, _dp_px)
         if _dq is not None:
             _q0 = np.array(arm._ticks_to_qpos(arm.read_ticks()), dtype=np.float64)
-            _qc = np.array(_q0, dtype=np.float64)
-            _qc[:_dq.size] += np.radians(_dq)   # J 是像素/度，qpos 是弧度
-            _qc[5] = _q0[5] if axis_phase else arm.grip_hi
+            # **`_dq` 是度，`_q0` 是弧度**（`dq_for` 的雅可比是像素/度，
+            # `_ticks_to_qpos` 给的是 sim 弧度）。原来直接把度加在弧度上，一条指令让
+            # 3 号关节从 17.4° 转到 -88.3°（`out/panel_20261020_ppo2.log` 15:57:02
+            # 那一趟，TCP 被甩到 z=516mm，安全闸才拦住）。
+            _qc = _q0 + np.radians(_dq)
+            _qc[5] = (_q0[5] if axis_phase
+                      else float(getattr(arm, "grip_open", arm.grip_hi)))
             print(f"    雅可比：目标像素位移 ({_dp_px[0]:+.1f}, {_dp_px[1]:+.1f})px"
-                  f" → 关节 {np.round(_dq, 2)}°（已换成弧度下发）")
+                  f" → 关节 {np.round(np.degrees(_dq), 2)}°")
             from real import joint_move as _jm                       # noqa: PLC0415
             _jm.goto_q(arm, _qc, q_from=_q0, settle=0.15, hold=4)
         elif axis_phase and over_mv is None and not _amp_on:

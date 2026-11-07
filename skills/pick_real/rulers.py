@@ -4,7 +4,7 @@ from __future__ import annotations
 from core import follow, geom, shapes, vision
 import numpy as np
 from . import knobs
-from .knobs import AXIS_TOL_PX, CLEAR_3D_ENFORCE, CLEAR_3D_TOL_MM, CLEAR_BAND_HI_PX, CLEAR_BAND_LO_PX, CLEAR_BAND_ON, CLEAR_EXIT_EPS_PX, CLEAR_TARGET_PX, JAW_RAW_IMG, JAW_SHAPE_JSON, LOOK_IMG
+from .knobs import AXIS_TOL_PX, CLEAR_3D_ENFORCE, CLEAR_3D_TOL_MM, CLEAR_BAND_HI_PX, CLEAR_BAND_LO_PX, CLEAR_BAND_ON, CLEAR_EXIT_EPS_PX, CLEAR_FP_GAP_HI_MM, CLEAR_FP_GAP_LO_MM, CLEAR_TARGET_PX, JAW_RAW_IMG, JAW_SHAPE_JSON, LOOK_IMG
 from .pose import _fold90, _project_px, _px_per_mm, _wrist
 def _jaw_axis_deg(cam) -> float | None:
     """合爪轴在**画面里**的角度（度）。没描过轮廓、画幅对不上就返回 None。"""
@@ -443,12 +443,116 @@ def _put_lines(img, lines, col=(0, 255, 255), bottom: bool = False) -> None:
         cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, sc, (0, 0, 0), 6, cv2.LINE_AA)
         cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, sc, col, 2, cv2.LINE_AA)
 
+def _target_at_tip(arm, percep) -> dict | None:
+    """**爪尖所在那一层**上的目标范围，以及从爪尖出发的合爪轴射线穿不穿过它。
+
+    用户 2026-10-20 定的几何：
+      · 合爪轴 = 从**固定爪尖** `f` 出发、沿水平 `u`（固定爪→动爪）的一条**射线**，
+        高度恒为 `f.z`；
+      · 目标 = `percep` 估出来的占地范围（中心 + `yaw` + 半长），**垂直抬到 `f.z`** ——
+        长方体在每个高度的截面都是同一个矩形，抬上去不改变水平范围，只改投影位置；
+      · 「穿过」要同时成立：目标还在射线**前方**（`s + h_u >= 0`），且横向**跨过**这条
+        射线（`|p| <= h_n`）。
+
+    `s` = 爪尖到目标中心沿轴的距离，`h_u` / `h_n` = 矩形沿 `u` / `n` 的支撑长度
+    （`hx·|ax··| + hy·|ay··|`，`ax`/`ay` 是按 `yaw` 转过的方块两条水平轴）。
+    **`s - h_u` = 爪尖到目标近面的缝**（米）。
+
+    **2026-10-20 之前判的是一条无限长直线**：方块整块落在爪尖后面时它照样说「穿过」。
+    改成射线是用户当天指出的（「轴是从爪尖开始的一条射线」）。
+
+    **为什么不拿可见红区判**：固定爪贴着方块近面的时候会把那一截挡掉，可见红区就停在
+    被挡的地方 —— 那一趟方块横跨 −138~−8 像素、合爪轴在 0，差 8 像素就判成「没穿过」，
+    缝那一维整趟没有读数、也就没法造缝。
+
+    估不出来（这一眼没量到世界坐标 / 没有尺寸 / 拿不到两爪尖）返回 None ——
+    调用方退回可见红区那条老判据，不拿一个凑出来的数当答案。
+    """
+    last = getattr(percep, "last", None) or {}
+    if last.get("where") != "world" or not last.get("world"):
+        return None
+    try:
+        c_w = np.asarray(last["world"], dtype=np.float64).reshape(-1)
+        yaw = float(np.radians(float(last.get("yaw_deg", 0.0))))
+    except Exception:                                           # noqa: BLE001
+        return None
+    if c_w.size < 3:
+        return None
+    spec = (getattr(percep, "spec_used", None)
+            or getattr(percep, "spec", None) or {})
+    try:
+        from core.shapes import from_spec                        # noqa: PLC0415
+
+        sh = from_spec(spec)
+    except Exception:                                           # noqa: BLE001
+        return None
+    hx = float(getattr(sh, "half_x", getattr(sh, "radius", 0.0)))
+    hy = float(getattr(sh, "half_y", getattr(sh, "radius", 0.0)))
+    if hx <= 0.0 or hy <= 0.0:
+        return None
+    try:
+        f, m = arm.tips()
+    except Exception:                                           # noqa: BLE001
+        return None
+    f = np.asarray(f, dtype=np.float64).reshape(-1)[:3]
+    m = np.asarray(m, dtype=np.float64).reshape(-1)[:3]
+    u = m - f
+    u[2] = 0.0
+    nu = float(np.linalg.norm(u))
+    if nu < 1e-9:
+        return None
+    u = u / nu
+    u = u[:2]                       # 水平面上的一条射线：后面全程 2D（`r` 也是 2D）
+    n = np.array([-u[1], u[0]], dtype=np.float64)
+    r = c_w[:2] - f[:2]
+    p = float(np.dot(r, n))
+    s = float(np.dot(r, u))
+    ax = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
+    ay = np.array([-np.sin(yaw), np.cos(yaw)], dtype=np.float64)
+    hn = abs(hx * float(np.dot(ax, n))) + abs(hy * float(np.dot(ay, n)))
+    hu = abs(hx * float(np.dot(ax, u))) + abs(hy * float(np.dot(ay, u)))
+    return {"crosses": bool(abs(p) <= hn and s + hu >= 0.0),
+            "p_mm": p * 1000.0, "hn_mm": hn * 1000.0,
+            "s_mm": s * 1000.0, "hu_mm": hu * 1000.0,
+            "gap_mm": (s - hu) * 1000.0,
+            # 基座系的两个单位向量（水平面）：`u` = 合爪轴，`n` = 轴的法向。
+            # `p_mm` 是沿 `n` 量的带符号垂距 —— 把定位目标挪 `p_mm * n` 就能让
+            # 射线穿过方块中心。VLM 的位移候选按它算（2026-10-23）。
+            "ux": float(u[0]), "uy": float(u[1]),
+            "nx": float(n[0]), "ny": float(n[1]),
+            "center": c_w, "yaw": yaw, "hx": hx, "hy": hy, "z_tip": float(f[2])}
+
+
+def _target_px(cam, fp, z: float | None = None) -> np.ndarray | None:
+    """把目标占地范围**抬到爪尖那一层**（`z`，默认就是爪尖的高度）再投到画面。
+
+    返回 4 个角（像素，`(4, 2)`）。斜俯视下 z 差十几毫米，投影能差几十像素，所以
+    「抬高」这一步不能省（用户 2026-10-20：「鼓出来的占地范围还要垂直抬高到爪子尖」）。
+
+    投不出来（没有相机 / 没机位 / 角点在相机背后）返回 None —— 调用方退回可见红区。
+    """
+    if cam is None or fp is None:
+        return None
+    c = np.asarray(fp["center"], dtype=np.float64).reshape(-1)
+    zz = float(c[2] if z is None else z)
+    ax = np.array([np.cos(fp["yaw"]), np.sin(fp["yaw"]), 0.0], dtype=np.float64)
+    ay = np.array([-np.sin(fp["yaw"]), np.cos(fp["yaw"]), 0.0], dtype=np.float64)
+    base = np.array([float(c[0]), float(c[1]), zz], dtype=np.float64)
+    out = []
+    for sx, sy in ((1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)):
+        uv = _project_px(cam, base + sx * fp["hx"] * ax + sy * fp["hy"] * ay)
+        if uv is None:
+            return None
+        out.append(np.asarray(uv, dtype=np.float64).reshape(-1)[:2])
+    return np.asarray(out, dtype=np.float64)
+
+
 def _jaw_check(cam, percep, arm, tag: str, axis_only: bool = False) -> dict:
     """合爪前那一眼：红区离**整圈爪子轮廓**多少像素、目标中心离合爪轴多少像素。只读。
 
-    · `gap`：`real/perception.py` 选中的那块红区的轮廓里**最靠里的那一个点**，到描好的爪子
-      轮廓（`fixed_jaw` 必有，`moving_closed` 描了就算）的带号距离，取负值 ——
-      **正 = 整块红区都在爪子外面（留了缝），负 = 有红像素探进爪子里（接触了）**。
+    · `gap`：沿合爪轴，爪轮廓和目标之间还剩多少像素。**参照优先用「抬到爪尖高度的
+      占地范围」**（`_target_at_tip` + `_target_px`，2026-10-20）；估不出来时才退回
+      可见红区的轮廓。正 = 目标在爪子外面（留了缝），负 = 压进爪子里（接触了）。
       **哪一圈被探得最狠就报哪一圈** —— 压上去的可能是固定爪，也可能是动爪合过来那一下
       落的地方。
     · `axis`：**方块顶面中心**（`_box_center_px`，不是整块重心）离合爪轴
@@ -516,9 +620,11 @@ def _jaw_check(cam, percep, arm, tag: str, axis_only: bool = False) -> dict:
     # **第二条缝的尺子：整块退出去还要多少像素。** 见 `_exit_px` 的说明 —— `gap` 只看
     # 最近的那一个点，方块大半压在轮廓里时它会说「只差几个像素」。
     gap_exit = _exit_px(list(polys.values()), pts, axis_dir)
-    # **拦门的那条缝换成「沿合爪轴的净空」**（用户 2026-10-16 定：量上面那段缝是错的）。
-    # 最近距离那条（`gap`）照量照打，只留作参考。
-    gap_axis = _gap_axis_px(list(polys.values()), pts, axis_dir)
+    # **拦门的那条缝量的是「沿合爪轴的净空」**（用户 2026-10-16 定：量上面那段缝是错的）。
+    # 先按可见红区量一份（参考）；下面如果目标范围估得出来，换成**抬到爪尖高度的那一份**。
+    gap_vis = _gap_axis_px(list(polys.values()), pts, axis_dir)
+    gap_axis = gap_vis
+    gap_src = "可见红区"
     gap_near = gap
 
     # **量缝之前先看合爪轴有没有真的对着方块**（用户 2026-10-17）：「首先得要让夹取方向
@@ -526,12 +632,32 @@ def _jaw_check(cam, percep, arm, tag: str, axis_only: bool = False) -> dict:
     # 合爪轴自己那条线（偏移 0）在不在方块横跨的那一段里。不在 = 轴根本没穿过它，这时
     # 沿轴量出来的那个数是「离得多远」，不是「缝」—— 这条缝不认，按「量不出来」办。
     _lat = (pts - ref) @ n_hat
-    axis_in = bool(float(_lat.min()) <= 0.0 <= float(_lat.max()))
+    _vis_in = bool(float(_lat.min()) <= 0.0 <= float(_lat.max()))
+    # **轴穿没穿过方块：按估出来的占地范围判，不只按可见红区**（用户 2026-10-20）。
+    # 可见红区会被爪子挡掉一截，判「没穿过」之后缝那一维就没有读数、也就造不了缝。
+    _fp = _target_at_tip(arm, percep)
+    axis_in = bool(_vis_in or (_fp is not None and _fp["crosses"]))
+    _fp_txt = ("占地范围估不出来" if _fp is None else
+               f"占地范围：中心离轴 {_fp['p_mm']:+.1f}mm（跨过射线 ±{_fp['hn_mm']:.1f}）、"
+               f"近面在爪尖前 {_fp['gap_mm']:+.1f}mm"
+               f"（沿轴 {_fp['s_mm']:+.1f} ± {_fp['hu_mm']:.1f}）")
+    # **缝的参照也换成「爪尖所在高度的目标范围」**（用户 2026-10-20）。可见红区是各层
+    # 剪影叠出来的，近的那一截还会被固定爪挡掉；抬高到 `z_tip` 的那一圈矩形才是「爪尖
+    # 这一层上目标在哪」。估不出来 / 投不出来就退回可见红区，不拿凑出来的数当答案。
+    if _fp is not None and axis_in:
+        _q = _target_px(cam, _fp, _fp["z_tip"])
+        if _q is not None:
+            gap_axis = _gap_axis_px(list(polys.values()), _q, axis_dir)
+            gap_src = "占地范围（抬到爪尖高度）"
     if not axis_in:
-        print(f"    {tag}缝不量：合爪轴没穿过方块（方块横跨 "
+        print(f"    {tag}缝不量：合爪轴没穿过方块（{_fp_txt}；可见红区横跨 "
               f"{float(_lat.min()):+.0f}~{float(_lat.max()):+.0f} 像素，合爪轴在 0 那一条）"
               f" —— 离得太远，沿轴量出来的不是缝")
         gap_axis = None
+    elif not _vis_in:
+        # 只有占地范围这一条说穿过 —— 明确打出来，别让人以为可见红区也到了。
+        print(f"    {tag}合爪轴按**估出来的占地范围**判穿过（{_fp_txt}）；可见红区只到 "
+              f"{float(_lat.min()):+.0f}~{float(_lat.max()):+.0f} 像素 —— 近的那一截被挡住了，缝照量")
 
     # **`axis_only=True`（下探之后那一趟）缝这条不拦门**（用户 2026-10-17：「下探后的微调
     # 无需调整缝隙……微调如果第一眼就符合就不用调整了」）。判据只剩轴偏这一条，缝照量照打。
@@ -541,8 +667,14 @@ def _jaw_check(cam, percep, arm, tag: str, axis_only: bool = False) -> dict:
     # `下探之后（只修轴偏）轮廓：缝 +10 像素（要落在 [20, 75] 里）  轴偏 +9 像素（容 ≤35）
     # → 不过` —— 轴偏 +9 明明在容内，那一行却报「不过」，就是因为缝在替它拦门。
     gap_ok = bool(gap_axis is not None and _gap_ok(gap_axis))
-    ok = bool(abs(axis) <= AXIS_TOL_PX) if axis_only else bool(
-        gap_ok and abs(axis) <= AXIS_TOL_PX)
+    # **这一眼放不放行也换成新尺子**（2026-10-20 用户定）：射线穿过抬到爪尖高度的占地范围，
+    # 且爪尖到近面落在 `[CLEAR_FP_GAP_LO_MM, CLEAR_FP_GAP_HI_MM]` 里。像素那条缝 / 轴偏
+    # 照量照打，**不再拦门**。估不出占地范围 = 判不了 = 不放行（和 `_clearance_loop` 同口径）。
+    if _fp is None:
+        ok = False
+    else:
+        _fp_gap_ok = bool(CLEAR_FP_GAP_LO_MM <= float(_fp["gap_mm"]) <= CLEAR_FP_GAP_HI_MM)
+        ok = bool(_fp["crosses"]) if axis_only else bool(_fp["crosses"] and _fp_gap_ok)
     # **缝这条要落在带里**（2026-10-16 用户定）：低于下限 = 爪面压上方块，高于上限 = 方块
     # 已经退出两爪之间。老口径只有下限，所以退得越远越「合格」—— 那正是空抓的那一半。
     want = (f"要落在 [{CLEAR_BAND_LO_PX:.0f}, {CLEAR_BAND_HI_PX:.0f}] 里＝方块在两爪之间"
@@ -551,10 +683,13 @@ def _jaw_check(cam, percep, arm, tag: str, axis_only: bool = False) -> dict:
         want = f"只报数（这一趟不拦门；拦门的是轴偏 ≤{AXIS_TOL_PX:.0f}）"
     _gap_txt = "—（合爪轴没穿过方块）" if gap_axis is None else f"{gap_axis:+.0f}"
     print(f"    {tag}轮廓：缝 {_gap_txt} 像素（{want}，**沿合爪轴**"
-          f"量；最近距离那条 {gap_near:+.0f}、最近的是 {which}；整块退出去还要 {gap_exit:.0f}）"
+          f"量；参照 {gap_src}，可见红区那条 {float(gap_vis):+.0f}"
+          f"；最近距离那条 {gap_near:+.0f}、最近的是 {which}；整块退出去还要 {gap_exit:.0f}）"
           f"  轴偏 {axis:+.0f} 像素（容 ≤{AXIS_TOL_PX:.0f}）"
           f"  沿轴 {along:+.0f}  方块中心 ({box_uv[0]:.0f},{box_uv[1]:.0f})"
-          f"  → {'过' if ok else '不过'}")
+          f"  → {'过' if ok else '不过'}"
+          f"；新尺子：射线{'穿过' if (_fp is not None and _fp['crosses']) else '没穿过'}"
+          f"{'' if _fp is None else f'（离轴 {_fp['p_mm']:+.1f}mm / 跨过 ±{_fp['hn_mm']:.1f}；爪尖到近面 {_fp['gap_mm']:+.1f}mm / 要落在 [{CLEAR_FP_GAP_LO_MM:.1f}, {CLEAR_FP_GAP_HI_MM:.1f}] 里）'}")
 
     # 画一张：这一刻的画面 + 描好的轮廓 + 合爪轴 + 红区轮廓 + 读数。
     # **固定文件名，覆盖**。检查没过、或者事后想知道「那一眼看成什么样」，看它。
@@ -583,7 +718,13 @@ def _jaw_check(cam, percep, arm, tag: str, axis_only: bool = False) -> dict:
     cv2.imwrite(str(knobs.JAW_CHECK_IMG), bgr)
 
     return {"ok": ok, "gap": None if gap_axis is None else float(gap_axis),
-            "axis_in": axis_in, "gap_near": float(gap_near),
+            "gap_src": gap_src, "gap_vis": float(gap_vis),
+            "axis_in": axis_in, "axis_in_vis": _vis_in,
+            # **只留标量**：这一份会被 `json.dumps` 写进 `ppo/runs/*.json`，numpy 数组写不了。
+            "footprint": None if _fp is None else {
+                k: _fp[k] for k in ("crosses", "p_mm", "hn_mm",
+                                    "s_mm", "hu_mm", "gap_mm")},
+            "gap_near": float(gap_near),
             "gap_exit": float(gap_exit), "which": which,
             "axis": axis, "along": along,
             "box_uv": box_uv, "c_uv": c_uv, "band_uv": band_uv, "near_uv": near,

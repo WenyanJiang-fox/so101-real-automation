@@ -61,12 +61,22 @@ def goto_path(arm, q_list, *, hz=HZ, jvel=JVEL, jacc=JACC, settle=SETTLE,
     """
     qs_in = [np.asarray(q, dtype=np.float64) for q in q_list]
     q_goal = qs_in[-1]
+    # **2 号肩抬的绝对下限**（2026-10-24 用户定）：关节空间这条路上也要拦。
+    # 只验**目标点**，不验插值点 —— 从一个已经后仰过头的姿态回初始位置时，
+    # 插值点必然在限位那一侧，验了就把回位本身拦死了。
+    from real import safety                                       # noqa: PLC0415
+    if safety.check_joint_abs(arm, q_goal):
+        return arm._ticks_to_qpos(arm.read_ticks())
     traj = build(qs_in, vmax=jvel, amax=jacc, density=0.01)
     _ts, qs, _ = traj.sample(1.0 / hz)
     dt = 1.0 / hz
     t0 = time.time()
     for i, q in enumerate(qs):
         arm.write_ticks(arm._qpos_to_ticks(q))
+        # **发出去的那个目标位置**（度），给录数据的 action 用。`drive` 那条路自己会写
+        # （`real/arm.py:498-542`），这条不写的话 `run_sim.py:588-590` 只能退回
+        # `arm.angles()` —— 那录下来的是观测，不是指令。
+        arm.last_action = np.degrees(q)
         _tick(arm)
         nap = (i + 1) * dt - (time.time() - t0)
         if nap > 0:
@@ -76,6 +86,7 @@ def goto_path(arm, q_list, *, hz=HZ, jvel=JVEL, jacc=JACC, settle=SETTLE,
     t1 = time.time()
     for _ in range(int(hold)):
         arm.write_ticks(arm._qpos_to_ticks(q_goal))
+        arm.last_action = np.degrees(q_goal)
         _tick(arm)
         time.sleep(dt)
     t2 = time.time()

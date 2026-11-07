@@ -32,7 +32,12 @@ from real import joint_move as jm                                 # noqa: E402
 
 # 到位判据：六个关节里离目标最远的那个允许多少度。舵机是位置控制的，走完总有残余
 # 误差；`real_home.py` 记的是「走完读回 1.1mm 内一致」，换算成关节角是个小值。
-HOME_TOL_DEG = 3.0
+#
+# **2026-10-22 按实测从 3 放到 5**（用户定）。连着两轮四次回位都停在 3.1 / 3.1 /
+# 3.3 / 3.1°，只读一次关节角定位到 **3 号（elbow_flex）稳定差 +3.25°**，其余五轴
+# ≤0.65°。起点一致性另有 `collect_real_dataset.HOME_DRIFT_MM = 10mm` 按 TCP 兜底，
+# 这里只判「有没有真的开回家」，不放宽那一层。
+HOME_TOL_DEG = 5.0
 
 
 @register("skill", "home_real")
