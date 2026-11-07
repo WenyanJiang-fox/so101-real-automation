@@ -26,19 +26,18 @@
 | 策略路由 | 三档 `oneshot` / `full` / `vla_end`，按失败码自动路由 |
 | VLM 判官 | Qwen3-VL LoRA r16/α32；6 类失败场景 300 条成对训练，280 条评测二分类准确率 92.9% |
 
-表中的端到端时间、成功率、采集条数和有效率来自真机实测汇报口径；其余数字可以在代码与配置里对到。有效率 = 判 `held` 并写进数据集的集数占全部采集集数的比例；没抓成的整集丢弃。
+表中的端到端时间、成功率、采集条数和有效率来自真机实测记录；其余数字可以在代码与配置里对到。有效率 = 判 `held` 并写进数据集的集数占全部采集集数的比例；没抓成的整集丢弃。
 
 ## 3. 方法与流水线
 
 ### 3.1 五接口
 
-`core/interfaces.py` 定义了 6 个抽象基类。对外按五块讲：臂、相机、策略、判官、技能；感知单独列为第六块，因为它也需要独立替换。
+主循环只认五块：臂、相机、策略、判官、技能。代码里感知也单独成接口（`Perceptor`，跟着相机这一块装配），所以 `core/interfaces.py` 实际有 6 个抽象基类。
 
 | 零件 | 职责 | 现有实现 |
 |---|---|---|
 | 机械臂 `Arm` | 动：读 TCP、朝目标走一小步、读关节角/接触 | `impls/arm_sim.py`、`real/arm.py` |
-| 相机 `Camera` | 看：给一帧、给尺寸、给机位/内参 | `impls/cam_sim.py`、`real/cameras.py`、`real/side_cam.py` |
-| 感知 `Perceptor` | 认：按指令找目标并给出世界坐标 | `impls/perception.py`、`real/perception.py` |
+| 相机 `Camera` / 感知 `Perceptor` | 看：给一帧、给尺寸、给机位/内参；认：按指令找目标并给出世界坐标 | `impls/cam_sim.py`、`real/cameras.py`、`real/side_cam.py`；`impls/perception.py`、`real/perception.py` |
 | 策略 `Policy` | 决定顺序：一次给一串动作 | `impls/policy_expert.py`、`impls/policy_real.py` |
 | 判官 `Judge` | 轮末判成败 | `impls/judge_truth.py`、`impls/judge_grasp.py`、`impls/judge_held.py` |
 | 技能 `Skill` | 干一件小事：抓/放/回位/安全检查 | `skills/pick.py`、`skills/pick_real/` |
@@ -285,26 +284,30 @@ python _vla_end_try.py
 
 ## 8. 演示媒体
 
-GitHub 不能内嵌播放 mp4，点封面图会打开 `docs/media/videos/` 下的原始视频。
+下面是 GIF 预览，会直接在 README 里循环播放；每行末尾有对应的完整 mp4。
 
 ### 无人值守连续采集
 
-| | |
+| 预览 | 这一段发生了什么 |
 |---|---|
-| [![15 秒](docs/media/thumbs/00-unattended-15s.jpg)](docs/media/videos/00-unattended-15s.mp4)<br>**15 秒原速**：完整一趟采集 | [![23 分钟 8 倍速](docs/media/thumbs/01-unattended-23min-8x.jpg)](docs/media/videos/01-unattended-23min-8x.mp4)<br>**23 分钟 8 倍速**：连续多趟不干预 |
+| ![15 秒采集](docs/media/gifs/00-unattended-15s.gif) | **一趟完整抓放（15 秒原速）**：从初始位找到方块，转腕对轴、竖直下探、合爪、抬到目标点后松开。[完整 mp4](docs/media/videos/00-unattended-15s.mp4) |
+| ![23 分钟 8 倍速](docs/media/gifs/01-unattended-23min-8x.gif) | **连续多趟（23 分钟压到 8 倍速）**：抓完自动把方块摆到下一个位置、回零再来；没抓成的趟也会回零重试。[完整 mp4](docs/media/videos/01-unattended-23min-8x.mp4) |
 
 ### 脚本三档
 
-| | |
+| 预览 | 这一段发生了什么 |
 |---|---|
-| [![一步到位](docs/media/thumbs/02-script-oneshot.jpg)](docs/media/videos/02-script-oneshot.mp4)<br>**一步到位**：跳过合爪前微调 | [![先量一眼](docs/media/thumbs/03-script-measure-once.jpg)](docs/media/videos/03-script-measure-once.mp4)<br>**先量一眼**：量缝后微调 |
-| [![完整微调](docs/media/thumbs/04-script-full-finetune.jpg)](docs/media/videos/04-script-full-finetune.mp4)<br>**完整微调**：画面雅可比闭环 | [![微调 5 次](docs/media/thumbs/05-script-finetune-5x.jpg)](docs/media/videos/05-script-finetune-5x.mp4)<br>**微调 5 次**：连续纠偏 |
+| ![一步到位](docs/media/gifs/02-script-oneshot.gif) | **一步到位**：合爪前不做微调，爪尖直接到由方块中心算出的落点，竖直下扎、合爪、抬起。[完整 mp4](docs/media/videos/02-script-oneshot.mp4) |
+| ![先量一眼](docs/media/gifs/03-script-measure-once.gif) | **先量一眼**：下探前先在腕相机里量爪面到方块的缝，按这一眼的实测把落点修正后再下扎。[完整 mp4](docs/media/videos/03-script-measure-once.mp4) |
+| ![完整微调](docs/media/gifs/04-script-full-finetune.gif) | **完整微调**：合爪前用画面雅可比反复小幅平移，把方块推回两爪正中间再合爪。[完整 mp4](docs/media/videos/04-script-full-finetune.mp4) |
+| ![多轮微调](docs/media/gifs/05-script-finetune-multi.gif) | **多轮微调**：同一个落点连续纠偏多次，展示画面闭环在偏差较大时的收敛过程。[完整 mp4](docs/media/videos/05-script-finetune-multi.mp4) |
 
 ### VLA 末段
 
-| | |
+| 预览 | 这一段发生了什么 |
 |---|---|
-| [![腕子对齐后交给 π0.5](docs/media/thumbs/06-vla-handover.jpg)](docs/media/videos/06-vla-handover.mp4)<br>**腕子对齐后交给 π0.5**：脚本对轴，模型接管下探合爪 | [![模型先夹空再重夹](docs/media/thumbs/07-vla-retry.jpg)](docs/media/videos/07-vla-retry.mp4)<br>**先夹空再重夹**：失败后按判据重来 |
+| ![腕子对齐后交给 π0.5](docs/media/gifs/06-vla-handover.gif) | **腕部对齐后交给 π0.5**：脚本先把腕子转到方块侧面的法向，π0.5 从这一帧接管下探、横向对齐和合爪。[完整 mp4](docs/media/videos/06-vla-handover.mp4) |
+| ![先夹空再重夹](docs/media/gifs/07-vla-retry.gif) | **模型先夹空再重夹**：π0.5 第一次合爪夹空，6 号舵机判定为 empty 后抬回悬停点，第二次下扎才夹住。[完整 mp4](docs/media/videos/07-vla-retry.mp4) |
 
 ## 9. 已知边界
 
